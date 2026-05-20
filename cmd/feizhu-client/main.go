@@ -25,6 +25,11 @@ func main() {
 	networkService := flag.String("network-service", "", "仅 macOS：networksetup 服务名（如 Wi-Fi）；空则自动选择")
 	socks := flag.Bool("socks", true, "启用本地 SOCKS5；关闭后不监听、不配置系统 SOCKS")
 	socksListen := flag.String("socks-listen", "127.0.0.1:7891", "SOCKS5 监听地址（-socks=false 时忽略）")
+	tun := flag.Bool("tun", false, "启用 TUN 虚拟网卡透明代理模式（macOS/Windows，需要管理员权限；仅转发 TCP，UDP 暂不支持）")
+	tunDevice := flag.String("tun-device", "", "TUN 网卡名称；macOS 默认 utun123，Windows 默认 FeizhuTunnel")
+	tunAddress := flag.String("tun-address", "10.255.0.1/30", "TUN 网卡 IPv4 地址/CIDR")
+	tunMTU := flag.Int("tun-mtu", 1500, "TUN 网卡 MTU")
+	upstreamProxy := flag.String("upstream-proxy", "", "上级 HTTP/SOCKS5 代理 URL（如 http://user:pass@15.235.183.47:2000）；本地 7890/7891 经此转发，TUN 时该 IP 旁路直连")
 	printProxyEnv := flag.Bool("print-proxy-env", false, "仅打印终端用 http(s)_proxy 等环境变量脚本并退出（无需 -server/-password）")
 	flag.Parse()
 
@@ -55,6 +60,11 @@ func main() {
 		NetworkService: *networkService,
 		SOCKS:          *socks,
 		SOCKSListen:    *socksListen,
+		TUN:            *tun,
+		TUNDevice:      *tunDevice,
+		TUNAddress:     *tunAddress,
+		TUNMTU:         *tunMTU,
+		UpstreamProxy:  *upstreamProxy,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

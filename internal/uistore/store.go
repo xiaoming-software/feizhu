@@ -15,9 +15,10 @@ const (
 
 // Settings 上次成功登录时保存的表单内容。
 type Settings struct {
-	Host     string `json:"host"`
-	Port     string `json:"port"`
-	Password string `json:"password"`
+	Host          string `json:"host"`
+	Port          string `json:"port"`
+	Password      string `json:"password"`
+	UpstreamProxy string `json:"upstream_proxy,omitempty"`
 }
 
 func settingsPath() (string, error) {

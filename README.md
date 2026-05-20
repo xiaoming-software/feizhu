@@ -130,6 +130,10 @@ CGO_ENABLED=1 go build -o feizhu-client-ui ./cmd/feizhu-client-ui
 | `-auto-env` | `true` | 写入用户级 `http_proxy` 等 |
 | `-auto-curlrc` | `true` | 维护 `~/.curlrc` 代理段 |
 | `-network-service` | 空 | 仅 macOS：`networksetup` 网络服务名（如 `Wi-Fi`） |
+| `-tun` | `false` | 启用 TUN 虚拟网卡透明代理模式（macOS/Windows，需要管理员权限；MVP 仅转发 TCP） |
+| `-tun-device` | 平台默认 | TUN 网卡名称；macOS 默认 `utun123`，Windows 默认 `FeizhuTunnel` |
+| `-tun-address` | `10.255.0.1/30` | TUN 网卡 IPv4 地址/CIDR |
+| `-tun-mtu` | `1500` | TUN 网卡 MTU |
 | `-skip-login-check` | `false` | 跳过启动时远端密码校验（不推荐） |
 | `-print-proxy-env` | `false` | 仅打印 shell `export` 脚本后退出 |
 
@@ -146,10 +150,15 @@ eval "$(feizhu-client -print-proxy-env)"
 |------|-------|---------|-------|
 | 本地 HTTP/SOCKS 代理 | ✅ | ✅ | ✅ |
 | 自动系统代理 (`-auto-proxy`) | ✅ | ✅ | ❌ 请手动指向 `127.0.0.1:7890` 或 `-auto-proxy=false` |
+| TUN 透明代理 (`-tun`) | ✅ 需管理员权限 | ✅ 需管理员权限 | ❌ |
 | 用户级环境变量 (`-auto-env`) | ✅ launchctl | ✅ 注册表 | ✅ systemd --user |
 | `~/.curlrc` (`-auto-curlrc`) | ✅ | ✅ | ✅ |
 
 **macOS 提示**：若在 feizhu-client 启动前已打开「终端」，新建窗口可能读不到 `http_proxy`；请 **Cmd+Q 完全退出终端再打开**，或依赖默认开启的 `-auto-curlrc`。
+
+**TUN 提示**：`-tun` 会创建虚拟网卡；macOS 通过 `pf` 只拦截出站 TCP，不改默认路由、不劫持 UDP/DNS。若本机 DNS 返回 `198.18.0.0/15` fake-ip，客户端会从 TCP 首包解析 HTTPS SNI / HTTP Host 后用真实域名走 feizhu TLS 隧道。Windows 版仍需要管理员权限，当前实现保留 TUN 路由方式。
+
+GUI 客户端在勾选 TUN 时会保持主界面普通权限运行，并弹出系统授权：macOS 使用系统密码授权隐藏 helper，Windows 使用 UAC 启动隐藏 helper；未勾选 TUN 时仍使用原来的 HTTP/SOCKS fallback。
 
 **Linux 提示**：`-auto-proxy` 在 Linux 上会报错；可关闭后手动配置桌面环境或浏览器代理，并保留 `-auto-env` / `-auto-curlrc`。
 

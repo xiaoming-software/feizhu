@@ -135,6 +135,34 @@ ensure_app_icons() {
 	fi
 }
 
+ensure_windivert_runtime() {
+	local vendor_dir="$SCRIPT_DIR/vendor/windivert"
+	local dll="$vendor_dir/WinDivert.dll"
+	local sys="$vendor_dir/WinDivert64.sys"
+	if [[ ! -f "$dll" || ! -f "$sys" ]]; then
+		if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+			echo "警告: 缺少 curl/unzip，无法自动下载 WinDivert；Windows TUN TCP-only 运行时需要 WinDivert.dll 和 WinDivert64.sys。" >&2
+			return 0
+		fi
+		local tmp
+		tmp="$(mktemp -d)"
+		echo "==> 下载 WinDivert 2.2.2 运行文件（Windows TCP-only TUN 需要）…"
+		if curl -fsSL "https://reqrypt.org/download/WinDivert-2.2.2-A.zip" -o "$tmp/windivert.zip" &&
+			unzip -q "$tmp/windivert.zip" -d "$tmp"; then
+			mkdir -p "$vendor_dir"
+			cp "$tmp/WinDivert-2.2.2-A/x64/WinDivert.dll" "$dll"
+			cp "$tmp/WinDivert-2.2.2-A/x64/WinDivert64.sys" "$sys"
+		else
+			echo "警告: 下载 WinDivert 失败；Windows TUN TCP-only 运行时需要手动把 WinDivert.dll/WinDivert64.sys 放到 exe 同目录。" >&2
+		fi
+		rm -rf "$tmp"
+	fi
+	if [[ -f "$dll" && -f "$sys" ]]; then
+		cp "$dll" "$DIST/WinDivert.dll"
+		cp "$sys" "$DIST/WinDivert64.sys"
+	fi
+}
+
 build_macos() {
 	ensure_app_icons
 	local bundle_dir="$DIST/FeizhuClientUI.app"
@@ -173,6 +201,7 @@ build_macos() {
 
 build_windows_cross() {
 	ensure_app_icons
+	ensure_windivert_runtime
 	local cc="${MINGW_CC:-}"
 	if [[ -z "$cc" ]]; then
 		cc="$(pick_mingw_cc)" || {
@@ -192,6 +221,7 @@ build_windows_cross() {
 
 build_windows_native() {
 	ensure_app_icons
+	ensure_windivert_runtime
 	echo "==> 编译 Windows amd64（本机）…"
 	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 \
 		go build -trimpath -ldflags="-s -w -H windowsgui" -o "$DIST/feizhu-client-ui-windows-amd64.exe" ./cmd/feizhu-client-ui

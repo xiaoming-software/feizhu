@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -22,7 +23,9 @@ import (
 	"github.com/feizhu/feizhu/internal/proxyenv"
 	"github.com/feizhu/feizhu/internal/socks5"
 	"github.com/feizhu/feizhu/internal/sysproxy"
+	"github.com/feizhu/feizhu/internal/tunmode"
 	"github.com/feizhu/feizhu/internal/tunnel"
+	"github.com/feizhu/feizhu/internal/upstreamproxy"
 )
 
 var tunnelSeq atomic.Uint64
@@ -41,6 +44,13 @@ type Config struct {
 	NetworkService string
 	SOCKS          bool
 	SOCKSListen    string
+	TUN            bool
+	TUNDevice      string
+	TUNAddress     string
+	TUNMTU         int
+	// UpstreamProxy 为本地 HTTP/SOCKS 出口链路上级（http/socks5 URL）。
+	// 配置后：经 127.0.0.1:7890/7891 的流量走该上级；其 IP 在 TUN 模式下加入 pf 旁路以便本机直连认证。
+	UpstreamProxy string
 	// LogWriter 非 nil 时，标准 log 包输出会定向到此（例如 GUI 日志区）。
 	LogWriter io.Writer
 	// SuppressPerConnLogs 为 true 时不输出每个 HTTP/SOCKS 连接的「上线/转发/下线」流水日志，
@@ -136,6 +146,10 @@ func Run(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("[SOCKS] %w", err)
 		}
 	}
+	if cfg.TUN && !cfg.SOCKS {
+		_ = ln.Close()
+		return fmt.Errorf("[TUN] TUN 模式依赖本地 SOCKS5，请保持 -socks=true")
+	}
 
 	ph, pp, err := sysproxy.ParseListenAddr(cfg.LocalListen)
 	if err != nil {
@@ -150,6 +164,60 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.SOCKS {
 		socksURL = fmt.Sprintf("socks5://%s:%s", sh, sp)
 	}
+
+	var upstream *url.URL
+	if s := strings.TrimSpace(cfg.UpstreamProxy); s != "" {
+		upstream, err = upstreamproxy.Parse(s)
+		if err != nil {
+			_ = ln.Close()
+			if socksLn != nil {
+				_ = socksLn.Close()
+			}
+			return fmt.Errorf("[上级代理] %w", err)
+		}
+		log.Printf("[上级代理] 已配置 %s；上级代理握手将包在 feizhu TLS 隧道内，由 feizhu-server 连接上级代理。", upstream.Host)
+	}
+
+	dialer := &targetDialer{
+		upstream:   upstream,
+		serverAddr: cfg.ServerAddr,
+		password:   cfg.Password,
+		tlsCfg:     tlsCfg,
+	}
+
+	var tunCtl *tunmode.Controller
+	if cfg.TUN {
+		if err := curlrc.ClearManaged(); err != nil {
+			log.Printf("[TUN] 清理 ~/.curlrc 中旧的 feizhu 代理段失败: %v", err)
+		}
+		tunCtl, err = tunmode.Start(ctx, tunmode.Config{
+			Enabled:     true,
+			DeviceName:  cfg.TUNDevice,
+			AddressCIDR: cfg.TUNAddress,
+			MTU:         cfg.TUNMTU,
+			SOCKSListen: cfg.SOCKSListen,
+			ServerAddr:  cfg.ServerAddr,
+		})
+		if err != nil {
+			_ = ln.Close()
+			if socksLn != nil {
+				_ = socksLn.Close()
+			}
+			return fmt.Errorf("[TUN] 启动失败: %w", err)
+		}
+		log.Println("[TUN] 已启用虚拟网卡透明代理模式；TCP 流量将经本地 SOCKS5 再进入 feizhu TLS 隧道，UDP 暂不转发。")
+		if upstream != nil {
+			log.Println("[TUN] 已配置上级代理：链路为 本机 -> feizhu TLS -> feizhu-server -> 上级代理 -> 目标站。")
+		} else {
+			log.Println("[TUN] 提示：curl -x 外部代理 的 TCP 也会被透明拦截；若外部代理仅允许家庭宽带 IP 认证，请在 feizhu 配置「上级代理」并让应用走 127.0.0.1:7890。")
+		}
+	}
+	defer func() {
+		if tunCtl != nil {
+			tunCtl.Stop()
+			log.Println("[TUN] 已停止并尝试还原路由")
+		}
+	}()
 
 	if cfg.AutoProxy {
 		if err := sysproxy.Apply(ph, pp, sh, sp, cfg.NetworkService); err != nil {
@@ -243,7 +311,7 @@ func Run(ctx context.Context, cfg Config) error {
 				log.Printf("http accept: %v", err)
 				continue
 			}
-			go handleLocalConn(c, cfg.ServerAddr, cfg.Password, tlsCfg, cfg.SuppressPerConnLogs)
+			go handleLocalConn(c, dialer, cfg.SuppressPerConnLogs)
 		}
 	}()
 
@@ -261,7 +329,7 @@ func Run(ctx context.Context, cfg Config) error {
 					log.Printf("socks accept: %v", err)
 					continue
 				}
-				go handleSOCKS(c, cfg.ServerAddr, cfg.Password, tlsCfg, cfg.SuppressPerConnLogs)
+				go handleSOCKS(c, dialer, cfg.SuppressPerConnLogs, cfg.TUN)
 			}
 		}()
 	}
@@ -326,17 +394,52 @@ func logTerminalCurlHint(local, socksListen string, useSocks, autoEnv, autoCurlr
 	log.Printf("       单次测试: curl -x %s https://www.baidu.com", base)
 }
 
-func handleSOCKS(client net.Conn, serverAddr, password string, tlsCfg *tls.Config, suppressPerConn bool) {
+type targetDialer struct {
+	upstream   *url.URL
+	serverAddr string
+	password   string
+	tlsCfg     *tls.Config
+}
+
+func (d *targetDialer) dialLocal(host string, port uint16) (net.Conn, error) {
+	if d.upstream != nil {
+		return upstreamproxy.DialVia(d.upstream, host, port, d.connectViaTunnel)
+	}
+	return dialTunnel(d.serverAddr, d.password, d.tlsCfg, host, port)
+}
+
+func (d *targetDialer) dialTUN(host string, port uint16) (net.Conn, error) {
+	if d.upstream != nil {
+		return upstreamproxy.DialVia(d.upstream, host, port, d.connectViaTunnel)
+	}
+	return dialTunnel(d.serverAddr, d.password, d.tlsCfg, host, port)
+}
+
+func (d *targetDialer) connectViaTunnel(host string, port uint16) (net.Conn, error) {
+	return dialTunnel(d.serverAddr, d.password, d.tlsCfg, host, port)
+}
+
+func handleSOCKS(client net.Conn, dialer *targetDialer, suppressPerConn, fromTUN bool) {
 	sid := tunnelSeq.Add(1)
 	peer := client.RemoteAddr().String()
 	if !suppressPerConn {
 		log.Printf("[socks #%d] 连接 %s", sid, peer)
 	}
+	dialFn := dialer.dialLocal
+	via := "feizhu TLS 隧道"
+	if fromTUN {
+		dialFn = dialer.dialTUN
+		if dialer.upstream != nil {
+			via = "上级代理"
+		}
+	} else if dialer.upstream != nil {
+		via = "上级代理"
+	}
 	err := socks5.Serve(client, func(host string, port uint16) (net.Conn, error) {
 		if !suppressPerConn {
-			log.Printf("[socks #%d] 请求 CONNECT %s:%d（经 TLS 发往 feizhu-server）", sid, host, port)
+			log.Printf("[socks #%d] 请求 CONNECT %s:%d（经 %s）", sid, host, port, via)
 		}
-		return dialTunnel(serverAddr, password, tlsCfg, host, port)
+		return dialFn(host, port)
 	})
 	if err != nil {
 		log.Printf("[socks #%d] 结束 %s err=%v", sid, peer, err)
@@ -345,7 +448,7 @@ func handleSOCKS(client net.Conn, serverAddr, password string, tlsCfg *tls.Confi
 	}
 }
 
-func handleLocalConn(client net.Conn, serverAddr, password string, tlsCfg *tls.Config, suppressPerConn bool) {
+func handleLocalConn(client net.Conn, dialer *targetDialer, suppressPerConn bool) {
 	defer client.Close()
 	br := bufio.NewReader(client)
 	for {
@@ -354,10 +457,10 @@ func handleLocalConn(client net.Conn, serverAddr, password string, tlsCfg *tls.C
 			return
 		}
 		if req.Method == http.MethodConnect {
-			handleConnect(client, br, req, serverAddr, password, tlsCfg, suppressPerConn)
+			handleConnect(client, br, req, dialer, suppressPerConn)
 			return
 		}
-		if err := handleHTTP(client, br, req, serverAddr, password, tlsCfg, suppressPerConn); err != nil {
+		if err := handleHTTP(client, br, req, dialer, suppressPerConn); err != nil {
 			return
 		}
 		if req.Close {
@@ -366,7 +469,7 @@ func handleLocalConn(client net.Conn, serverAddr, password string, tlsCfg *tls.C
 	}
 }
 
-func handleConnect(client net.Conn, br *bufio.Reader, req *http.Request, serverAddr, password string, tlsCfg *tls.Config, suppressPerConn bool) {
+func handleConnect(client net.Conn, br *bufio.Reader, req *http.Request, dialer *targetDialer, suppressPerConn bool) {
 	host, portStr, err := net.SplitHostPort(req.Host)
 	if err != nil {
 		if strings.ContainsRune(req.Host, ':') {
@@ -391,15 +494,19 @@ func handleConnect(client net.Conn, br *bufio.Reader, req *http.Request, serverA
 		log.Printf("[隧道 #%d] 上线(浏览器) %s CONNECT %s", sid, browser, req.Host)
 	}
 
-	tlsConn, err := dialTunnel(serverAddr, password, tlsCfg, host, uint16(port))
+	via := "feizhu TLS 隧道"
+	if dialer.upstream != nil {
+		via = "上级代理 " + dialer.upstream.Host
+	}
+	rc, err := dialer.dialLocal(host, uint16(port))
 	if err != nil {
-		log.Printf("[隧道 #%d] 建立失败(远端) CONNECT %s err=%v", sid, req.Host, err)
+		log.Printf("[隧道 #%d] 建立失败(%s) CONNECT %s err=%v", sid, via, req.Host, err)
 		_ = writeHTTPLine(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		log.Printf("[隧道 #%d] 下线(未建立转发) %s", sid, browser)
 		return
 	}
 	defer func() {
-		tlsConn.Close()
+		rc.Close()
 		if !suppressPerConn {
 			log.Printf("[隧道 #%d] 下线 %s -> %s", sid, browser, req.Host)
 		}
@@ -410,12 +517,12 @@ func handleConnect(client net.Conn, br *bufio.Reader, req *http.Request, serverA
 	}
 
 	if !suppressPerConn {
-		log.Printf("[隧道 #%d] 开始双向转发 %s <-> %s", sid, browser, req.Host)
+		log.Printf("[隧道 #%d] 开始双向转发 %s <-> %s（%s）", sid, browser, req.Host, via)
 	}
-	relay(br, client, tlsConn)
+	relay(br, client, rc)
 }
 
-func handleHTTP(client net.Conn, br *bufio.Reader, req *http.Request, serverAddr, password string, tlsCfg *tls.Config, suppressPerConn bool) error {
+func handleHTTP(client net.Conn, br *bufio.Reader, req *http.Request, dialer *targetDialer, suppressPerConn bool) error {
 	if req.URL == nil {
 		_ = writeHTTPLine(client, "HTTP/1.1 400 Bad Request\r\n\r\n")
 		return fmt.Errorf("bad url")
@@ -446,22 +553,22 @@ func handleHTTP(client net.Conn, br *bufio.Reader, req *http.Request, serverAddr
 		log.Printf("[隧道 #%d] 上线(浏览器) %s %s %s", sid, browser, req.Method, u.String())
 	}
 
-	tlsConn, err := dialTunnel(serverAddr, password, tlsCfg, host, uint16(port))
+	rc, err := dialer.dialLocal(host, uint16(port))
 	if err != nil {
-		log.Printf("[隧道 #%d] 建立失败(远端) %s err=%v", sid, u.String(), err)
+		log.Printf("[隧道 #%d] 建立失败 %s err=%v", sid, u.String(), err)
 		_ = writeHTTPLine(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		log.Printf("[隧道 #%d] 下线(未建立转发) %s", sid, browser)
 		return err
 	}
 	defer func() {
-		tlsConn.Close()
+		rc.Close()
 		if !suppressPerConn {
 			log.Printf("[隧道 #%d] 下线 %s", sid, browser)
 		}
 	}()
 
 	req.RequestURI = ""
-	if err := req.Write(tlsConn); err != nil {
+	if err := req.Write(rc); err != nil {
 		return err
 	}
 
@@ -473,12 +580,12 @@ func handleHTTP(client net.Conn, br *bufio.Reader, req *http.Request, serverAddr
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(tlsConn, br)
-		tlsConn.Close()
+		_, _ = io.Copy(rc, br)
+		rc.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(client, tlsConn)
+		_, _ = io.Copy(client, rc)
 	}()
 	wg.Wait()
 	return nil

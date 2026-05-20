@@ -65,21 +65,38 @@ func Restore() error {
 		return nil
 	}
 	applied = false
+	return removeManagedBlock()
+}
+
+// ClearManaged 删除 ~/.curlrc 中的 feizhu 段（即使不是本进程写入的）。
+// TUN 提权 helper 启动时应调用，避免 curl 无 -x 时仍走 127.0.0.1:7890 而掩盖透明代理路径。
+func ClearManaged() error {
+	mu.Lock()
+	defer mu.Unlock()
+	applied = false
+	return removeManagedBlock()
+}
+
+func removeManagedBlock() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
 	_ = os.Remove(filepath.Join(home, ".feizhu", "curlrc.include"))
 	curlrcPath := filepath.Join(home, ".curlrc")
-	if old, err := os.ReadFile(curlrcPath); err == nil {
-		newBody := strings.TrimRight(stripBlock(string(old)), "\n")
-		if strings.TrimSpace(newBody) == "" {
-			_ = os.Remove(curlrcPath)
-		} else {
-			_ = os.WriteFile(curlrcPath, []byte(newBody+"\n"), 0600)
-		}
+	old, err := os.ReadFile(curlrcPath)
+	if err != nil {
+		return nil
 	}
-	return nil
+	if !strings.Contains(string(old), beginMarker) {
+		return nil
+	}
+	newBody := strings.TrimRight(stripBlock(string(old)), "\n")
+	if strings.TrimSpace(newBody) == "" {
+		_ = os.Remove(curlrcPath)
+		return nil
+	}
+	return os.WriteFile(curlrcPath, []byte(newBody+"\n"), 0600)
 }
 
 func mergeBlock(existing, block string) string {

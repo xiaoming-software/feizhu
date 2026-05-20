@@ -21,6 +21,9 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/feizhu/feizhu/internal/clientrunner"
+	"github.com/feizhu/feizhu/internal/curlrc"
+	"github.com/feizhu/feizhu/internal/proxyenv"
+	"github.com/feizhu/feizhu/internal/sysproxy"
 	"github.com/feizhu/feizhu/internal/uistore"
 )
 
@@ -152,6 +155,10 @@ func (w *debouncedBindingLog) Clear() {
 }
 
 func main() {
+	if runHelperIfRequested() {
+		return
+	}
+
 	a := app.NewWithID("github.com/feizhu.feizhu.feizhu-client-ui")
 	a.Settings().SetTheme(newSciFiTheme())
 	icon := appIcon()
@@ -173,6 +180,9 @@ func main() {
 	passEntry := widget.NewPasswordEntry()
 	passEntry.SetPlaceHolder("密码")
 
+	upstreamEntry := widget.NewEntry()
+	upstreamEntry.SetPlaceHolder("上级代理（可选）如 http://user:pass@15.235.183.47:2000")
+
 	if saved, err := uistore.Load(); err == nil && saved != nil {
 		if saved.Host != "" {
 			hostEntry.SetText(saved.Host)
@@ -182,6 +192,9 @@ func main() {
 		}
 		if saved.Password != "" {
 			passEntry.SetText(saved.Password)
+		}
+		if saved.UpstreamProxy != "" {
+			upstreamEntry.SetText(saved.UpstreamProxy)
 		}
 	}
 
@@ -222,12 +235,17 @@ func main() {
 
 	// 默认不输出每条连接的流水日志（避免拖垮界面）；需要排障时可勾选，下次点击「登录」生效。
 	verboseConnCheck := widget.NewCheck("显示每条连接的隧道日志（量多易卡）", nil)
+	tunCheck := widget.NewCheck("启用 TUN 全局透明代理（会弹系统授权，仅 TCP）", nil)
 
 	var (
-		runMu     sync.Mutex
-		runCancel context.CancelFunc
-		runWG     sync.WaitGroup
-		running   bool
+		runMu              sync.Mutex
+		runCancel          context.CancelFunc
+		elevatedChild      *elevatedProcess
+		userProxyFallback  bool
+		userCurlrcFallback bool
+		userEnvFallback    bool
+		runWG              sync.WaitGroup
+		running            bool
 	)
 
 	loginBtn := widget.NewButton("登录", nil)
@@ -244,10 +262,12 @@ func main() {
 			loginBtn.Disable()
 			stopBtn.Enable()
 			verboseConnCheck.Disable()
+			tunCheck.Disable()
 		} else {
 			loginBtn.Enable()
 			stopBtn.Disable()
 			verboseConnCheck.Enable()
+			tunCheck.Enable()
 		}
 	}
 
@@ -260,9 +280,36 @@ func main() {
 	stopClient := func() {
 		runMu.Lock()
 		c := runCancel
+		ep := elevatedChild
+		elevatedChild = nil
+		restoreUserProxy := userProxyFallback
+		restoreCurlrc := userCurlrcFallback
+		restoreEnv := userEnvFallback
+		userProxyFallback = false
+		userCurlrcFallback = false
+		userEnvFallback = false
 		runMu.Unlock()
-		if c != nil {
+		if ep != nil {
+			if err := stopElevatedClient(ep); err != nil {
+				statusLabel.SetText("停止 TUN helper 失败：" + err.Error())
+			}
+		} else if c != nil {
 			c()
+		}
+		if restoreCurlrc {
+			if err := curlrc.Restore(); err != nil {
+				logWriter.Write([]byte("[curl] 还原 ~/.curlrc 失败: " + err.Error() + "\n"))
+			}
+		}
+		if restoreEnv {
+			if err := proxyenv.Restore(); err != nil {
+				logWriter.Write([]byte("[代理环境] 还原失败: " + err.Error() + "\n"))
+			}
+		}
+		if restoreUserProxy {
+			if err := sysproxy.Restore(); err != nil {
+				logWriter.Write([]byte("[系统代理] 还原失败: " + err.Error() + "\n"))
+			}
 		}
 		runWG.Wait()
 		runMu.Lock()
@@ -306,9 +353,10 @@ func main() {
 			}
 
 			if saveErr := uistore.Save(&uistore.Settings{
-				Host:     host,
-				Port:     port,
-				Password: pass,
+				Host:          host,
+				Port:          port,
+				Password:      pass,
+				UpstreamProxy: strings.TrimSpace(upstreamEntry.Text),
 			}); saveErr != nil {
 				statusLabel.SetText("登录成功，但保存连接信息失败：" + saveErr.Error())
 			} else {
@@ -336,9 +384,70 @@ func main() {
 				NetworkService: "",
 				SOCKS:          true,
 				SOCKSListen:    "127.0.0.1:7891",
+				TUN:            tunCheck.Checked,
+				UpstreamProxy:  strings.TrimSpace(upstreamEntry.Text),
 				LogWriter:      logWriter,
 				// 未勾选「显示每条连接…」时省略逐连接流水，保留启动/错误等日志；防抖仍限制 UI 更新频率。
 				SuppressPerConnLogs: !verboseConnCheck.Checked,
+			}
+
+			if tunCheck.Checked {
+				ep, err := startElevatedClient(cfg)
+				if err != nil {
+					statusLabel.SetText("TUN 授权启动失败：" + err.Error())
+					dialog.ShowError(fmt.Errorf("TUN 授权启动失败: %w", err), w)
+					cancel()
+					runMu.Lock()
+					runCancel = nil
+					runMu.Unlock()
+					setRunning(false)
+					return
+				}
+				if err := waitElevatedHealthy(ep); err != nil {
+					_ = stopElevatedClient(ep)
+					statusLabel.SetText("TUN helper 未就绪：" + err.Error())
+					dialog.ShowError(fmt.Errorf("TUN helper 未就绪: %w", err), w)
+					cancel()
+					runMu.Lock()
+					runCancel = nil
+					runMu.Unlock()
+					setRunning(false)
+					return
+				}
+				runMu.Lock()
+				elevatedChild = ep
+				runMu.Unlock()
+				if err := sysproxy.Apply("127.0.0.1", "7890", "127.0.0.1", "7891", ""); err != nil {
+					logWriter.Write([]byte("[系统代理] TUN fallback 设置失败: " + err.Error() + "\n"))
+				} else {
+					runMu.Lock()
+					userProxyFallback = true
+					runMu.Unlock()
+					logWriter.Write([]byte("[系统代理] 已为当前用户启用 HTTP/HTTPS/SOCKS -> 127.0.0.1:7890/7891（浏览器 fallback）\n"))
+				}
+				if err := proxyenv.Apply(proxyenv.Config{
+					HTTPProxyURL:  "http://127.0.0.1:7890",
+					SOCKSProxyURL: "socks5://127.0.0.1:7891",
+					EnableSOCKS:   true,
+				}); err != nil {
+					logWriter.Write([]byte("[代理环境] TUN fallback 设置失败: " + err.Error() + "\n"))
+				} else {
+					runMu.Lock()
+					userEnvFallback = true
+					runMu.Unlock()
+					logWriter.Write([]byte("[代理环境] 已为新进程写入 127.0.0.1 代理变量\n"))
+				}
+				if err := curlrc.Apply("http://127.0.0.1:7890"); err != nil {
+					logWriter.Write([]byte("[curl] TUN fallback 写入 ~/.curlrc 失败: " + err.Error() + "\n"))
+				} else {
+					runMu.Lock()
+					userCurlrcFallback = true
+					runMu.Unlock()
+					logWriter.Write([]byte("[curl] 已写入 ~/.curlrc fallback，普通 curl 也会走 127.0.0.1:7890\n"))
+				}
+				statusLabel.SetText(fmt.Sprintf("TUN helper 已通过系统授权启动（PID %d）。停止时会自动关闭。", ep.PID))
+				logWriter.Write([]byte(fmt.Sprintf("[TUN] 已启动提权 helper PID=%d\n[TUN] helper 日志: %s\n", ep.PID, ep.LogFile)))
+				return
 			}
 
 			runWG.Add(1)
@@ -387,9 +496,13 @@ func main() {
 
 	btnRow := container.NewHBox(loginBtn, layout.NewSpacer(), stopBtn)
 
-	logHeaderRow := container.NewHBox(widget.NewLabel("◆ 运行日志"), layout.NewSpacer(), verboseConnCheck)
+	upstreamRow := container.NewBorder(nil, nil, widget.NewLabel("上级代理"), nil, upstreamEntry)
+	optionRow := container.NewHBox(tunCheck, layout.NewSpacer(), verboseConnCheck)
+	logHeaderRow := container.NewHBox(widget.NewLabel("◆ 运行日志"), layout.NewSpacer())
 	header := container.NewVBox(
 		serverRow,
+		optionRow,
+		upstreamRow,
 		btnRow,
 		statusLabel,
 		widget.NewSeparator(),
