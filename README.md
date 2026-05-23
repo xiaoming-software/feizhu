@@ -156,7 +156,9 @@ eval "$(feizhu-client -print-proxy-env)"
 
 **macOS 提示**：若在 feizhu-client 启动前已打开「终端」，新建窗口可能读不到 `http_proxy`；请 **Cmd+Q 完全退出终端再打开**，或依赖默认开启的 `-auto-curlrc`。
 
-**TUN 提示**：`-tun` 会创建虚拟网卡；macOS 通过 `pf` 只拦截出站 TCP，不改默认路由、不劫持 UDP/DNS。若本机 DNS 返回 `198.18.0.0/15` fake-ip，客户端会从 TCP 首包解析 HTTPS SNI / HTTP Host 后用真实域名走 feizhu TLS 隧道。Windows 版仍需要管理员权限，当前实现保留 TUN 路由方式。
+**TUN 提示**：macOS 通过 `pf` 只拦截出站 **TCP**，UDP/DNS 不走 TUN。Windows 使用 **WinDivert 仅拦 TCP**（与 mac 策略一致），经本地 SOCKS5 → feizhu TLS；**不劫持 UDP DNS**，指纹浏览器可继续用原有 DNS。`198.18.0.0/15` fake-ip 会从 TCP 首包解析 SNI/Host。
+
+**Windows 打包**：`build.sh` 将 **WinDivert.dll + WinDivert64.sys 嵌入 exe**，首次启用 TUN 时释放到 exe 同目录。发给客户**只需一个 exe**（需管理员/UAC 开 TUN）。
 
 GUI 客户端在勾选 TUN 时会保持主界面普通权限运行，并弹出系统授权：macOS 使用系统密码授权隐藏 helper，Windows 使用 UAC 启动隐藏 helper；未勾选 TUN 时仍使用原来的 HTTP/SOCKS fallback。
 

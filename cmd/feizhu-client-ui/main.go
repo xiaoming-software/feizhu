@@ -207,7 +207,9 @@ func main() {
 	portCell := container.NewGridWrap(fyne.NewSize(96, portCellH), portEntry)
 
 	statusLabel := widget.NewLabel("")
-	if hostEntry.Text != "" && passEntry.Text != "" {
+	if msg := cleanupStaleFeizhuState(); msg != "" {
+		statusLabel.SetText("启动时已清理上次异常退出残留：" + msg)
+	} else if hostEntry.Text != "" && passEntry.Text != "" {
 		statusLabel.SetText("已加载上次保存的连接信息，可直接点击「登录」。")
 	} else {
 		statusLabel.SetText("填写服务器与密码后点击「登录」。")
@@ -289,12 +291,13 @@ func main() {
 		userCurlrcFallback = false
 		userEnvFallback = false
 		runMu.Unlock()
+		if c != nil {
+			c()
+		}
 		if ep != nil {
 			if err := stopElevatedClient(ep); err != nil {
 				statusLabel.SetText("停止 TUN helper 失败：" + err.Error())
 			}
-		} else if c != nil {
-			c()
 		}
 		if restoreCurlrc {
 			if err := curlrc.Restore(); err != nil {
@@ -336,7 +339,7 @@ func main() {
 		}
 		serverAddr := net.JoinHostPort(host, port)
 		if _, _, err := net.SplitHostPort(serverAddr); err != nil {
-			dialog.ShowError(fmt.Errorf("地址格式无效: %w", err), w)
+			showErrorDialog(w, "地址格式无效", err)
 			return
 		}
 
@@ -347,7 +350,7 @@ func main() {
 			err := clientrunner.VerifyRemoteLogin(serverAddr, pass, tlsInsecure, "")
 			if err != nil {
 				statusLabel.SetText("登录失败：" + err.Error())
-				dialog.ShowError(fmt.Errorf("登录失败: %w", err), w)
+				showErrorDialog(w, "登录失败", err)
 				loginBtn.Enable()
 				return
 			}
@@ -392,10 +395,30 @@ func main() {
 			}
 
 			if tunCheck.Checked {
-				ep, err := startElevatedClient(cfg)
+				// macOS / Windows 均仅启动提权 helper（TUN + 本地 7890/7891），与 mac 行为一致。
+				elevCfg := cfg
+				elevCfg.TUN = true
+				elevCfg.SOCKS = true
+				elevCfg.SuppressPerConnLogs = true
+				elevCfg.AutoProxy = false
+				elevCfg.AutoEnv = false
+				elevCfg.AutoCurlrc = false
+				if clientrunner.PortInUse(cfg.LocalListen) {
+					cancel()
+					runMu.Lock()
+					runCancel = nil
+					runMu.Unlock()
+					setRunning(false)
+					msg := fmt.Errorf("%s 已被占用：请先完全退出飞猪（活动监视器结束 feizhu-client-ui 及 helper），或执行 lsof -i :7890 查看占用进程", cfg.LocalListen)
+					statusLabel.SetText(msg.Error())
+					showErrorDialog(w, "端口被占用", msg)
+					return
+				}
+
+				ep, err := startElevatedClient(elevCfg)
 				if err != nil {
 					statusLabel.SetText("TUN 授权启动失败：" + err.Error())
-					dialog.ShowError(fmt.Errorf("TUN 授权启动失败: %w", err), w)
+					showErrorDialog(w, "TUN 授权启动失败", err)
 					cancel()
 					runMu.Lock()
 					runCancel = nil
@@ -406,7 +429,7 @@ func main() {
 				if err := waitElevatedHealthy(ep); err != nil {
 					_ = stopElevatedClient(ep)
 					statusLabel.SetText("TUN helper 未就绪：" + err.Error())
-					dialog.ShowError(fmt.Errorf("TUN helper 未就绪: %w", err), w)
+					showErrorDialog(w, "TUN helper 未就绪", err)
 					cancel()
 					runMu.Lock()
 					runCancel = nil
@@ -445,8 +468,8 @@ func main() {
 					runMu.Unlock()
 					logWriter.Write([]byte("[curl] 已写入 ~/.curlrc fallback，普通 curl 也会走 127.0.0.1:7890\n"))
 				}
-				statusLabel.SetText(fmt.Sprintf("TUN helper 已通过系统授权启动（PID %d）。停止时会自动关闭。", ep.PID))
-				logWriter.Write([]byte(fmt.Sprintf("[TUN] 已启动提权 helper PID=%d\n[TUN] helper 日志: %s\n", ep.PID, ep.LogFile)))
+				statusLabel.SetText(fmt.Sprintf("TUN helper 已通过系统授权启动（PID %d）", ep.PID))
+				logWriter.Write([]byte(fmt.Sprintf("[TUN] 已启动提权 helper PID=%d\n[TUN] helper 日志: %s\n[TUN] 指纹浏览器可继续用配置里的远程代理；上级代理仅在飞猪填写即可\n", ep.PID, ep.LogFile)))
 				return
 			}
 
@@ -455,7 +478,7 @@ func main() {
 				defer runWG.Done()
 				if err := clientrunner.Run(ctx, cfg); err != nil {
 					statusLabel.SetText("运行错误：" + err.Error())
-					dialog.ShowError(fmt.Errorf("代理启动失败: %w", err), w)
+					showErrorDialog(w, "代理启动失败", err)
 				} else {
 					statusLabel.SetText("已停止。")
 				}
@@ -472,11 +495,15 @@ func main() {
 		stopClient()
 	}
 
-	w.SetCloseIntercept(func() {
+	shutdown := func() {
 		if isRunning() {
 			stopClient()
 		}
-		time.Sleep(50 * time.Millisecond)
+	}
+	a.Lifecycle().SetOnStopped(shutdown)
+	w.SetCloseIntercept(func() {
+		shutdown()
+		time.Sleep(400 * time.Millisecond)
 		w.Close()
 	})
 

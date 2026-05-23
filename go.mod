@@ -9,7 +9,7 @@ require (
 )
 
 require (
-	github.com/deblasis/godivert v1.0.1 // indirect
+	github.com/deblasis/godivert v1.0.1
 	github.com/go-gost/relay v0.5.0 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect

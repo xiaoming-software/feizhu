@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/feizhu/feizhu/internal/socks5"
 	"github.com/xjasonlyu/tun2socks/v2/core"
 	"github.com/xjasonlyu/tun2socks/v2/core/device"
 	"github.com/xjasonlyu/tun2socks/v2/core/device/tun"
@@ -35,9 +36,10 @@ type Config struct {
 	SOCKSListen string
 	ServerAddr  string
 	LogLevel    string
-	// BypassIPs 中的 IPv4 地址在 macOS pf 规则里不走 TUN（例如上级住宅代理 IP，
-	// 需由本机公网 IP 直连认证时）。
+	// BypassIPs 中的 IPv4 在 TUN 规则里旁路（仅用于必须本机直连的地址，勿填上级代理 IP）。
 	BypassIPs []string
+	// TunnelDial Windows 透明 TCP 直连 feizhu TLS（不经 127.0.0.1 SOCKS 网络回环）。
+	TunnelDial socks5.DialFunc
 }
 
 // Controller owns a running TUN engine and its platform routes.
@@ -66,13 +68,15 @@ func Start(ctx context.Context, cfg Config) (*Controller, error) {
 		return nil, fmt.Errorf("tunmode: ServerAddr 为空")
 	}
 
-	socksAddr, err := socksProxyAddress(cfg.SOCKSListen)
-	if err != nil {
-		return nil, err
-	}
+	// Windows：WinDivert 只拦 TCP，不碰 UDP/DNS（与 macOS pf proto tcp 等价）。
 	if runtime.GOOS == "windows" {
-		return startWindowsTCPOnly(ctx, cfg, socksAddr)
+		return startWindowsTCPRedirect(ctx, cfg)
 	}
+
+	return startDarwinTUNStack(ctx, cfg)
+}
+
+func startDarwinTUNStack(ctx context.Context, cfg Config) (*Controller, error) {
 	addr, ip, prefix, err := parseAddressCIDR(cfg.AddressCIDR)
 	if err != nil {
 		return nil, err
@@ -83,6 +87,10 @@ func Start(ctx context.Context, cfg Config) (*Controller, error) {
 		return nil, err
 	}
 
+	socksAddr, err := socksProxyAddress(cfg.SOCKSListen)
+	if err != nil {
+		return nil, err
+	}
 	socksProxy, err := proxy.NewSocks5(socksAddr, "", "")
 	if err != nil {
 		return nil, fmt.Errorf("tunmode: 创建 SOCKS5 上游失败: %w", err)
@@ -140,13 +148,13 @@ func (c *Controller) Stop() {
 		if c.stopFunc != nil {
 			c.stopFunc()
 		}
-		if err := restoreRoutes(routeConfig{
-			DeviceName: c.cfg.DeviceName,
-			State:      c.route,
-		}); err != nil {
-			log.Printf("[TUN] 路由还原失败: %v", err)
-		}
 		if c.stack != nil {
+			if err := restoreRoutes(routeConfig{
+				DeviceName: c.cfg.DeviceName,
+				State:      c.route,
+			}); err != nil {
+				log.Printf("[TUN] 路由还原失败: %v", err)
+			}
 			c.stack.Close()
 		}
 		closeDevice(c.device)

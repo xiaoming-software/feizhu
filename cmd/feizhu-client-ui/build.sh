@@ -135,32 +135,60 @@ ensure_app_icons() {
 	fi
 }
 
-ensure_windivert_runtime() {
+# 删除 dist 里旧的外置运行库（WinDivert/wintun 已嵌入 exe）。
+clean_obsolete_windows_dist() {
+	rm -f "$DIST/WinDivert.dll" "$DIST/WinDivert64.sys" "$DIST/wintun.dll"
+}
+
+# 下载 WinDivert 并写入 internal/tunmode/embed/，供 go:embed 打进 Windows exe。
+ensure_windivert_embed() {
+	local embed_dir="$ROOT/internal/tunmode/embed"
+	local embed_dll="$embed_dir/WinDivert.dll"
+	local embed_sys="$embed_dir/WinDivert64.sys"
 	local vendor_dir="$SCRIPT_DIR/vendor/windivert"
-	local dll="$vendor_dir/WinDivert.dll"
-	local sys="$vendor_dir/WinDivert64.sys"
-	if [[ ! -f "$dll" || ! -f "$sys" ]]; then
+	local cache_dll="$vendor_dir/WinDivert.dll"
+	local cache_sys="$vendor_dir/WinDivert64.sys"
+
+	if [[ -f "$embed_dll" && -f "$embed_sys" ]]; then
+		echo "    使用已存在的 embed/WinDivert.{dll,sys}"
+		return 0
+	fi
+
+	if [[ ! -f "$cache_dll" || ! -f "$cache_sys" ]]; then
 		if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
-			echo "警告: 缺少 curl/unzip，无法自动下载 WinDivert；Windows TUN TCP-only 运行时需要 WinDivert.dll 和 WinDivert64.sys。" >&2
-			return 0
+			echo "错误: 缺少 curl/unzip，无法下载 WinDivert（Windows 构建必需）。" >&2
+			return 1
 		fi
 		local tmp
 		tmp="$(mktemp -d)"
-		echo "==> 下载 WinDivert 2.2.2 运行文件（Windows TCP-only TUN 需要）…"
-		if curl -fsSL "https://reqrypt.org/download/WinDivert-2.2.2-A.zip" -o "$tmp/windivert.zip" &&
-			unzip -q "$tmp/windivert.zip" -d "$tmp"; then
-			mkdir -p "$vendor_dir"
-			cp "$tmp/WinDivert-2.2.2-A/x64/WinDivert.dll" "$dll"
-			cp "$tmp/WinDivert-2.2.2-A/x64/WinDivert64.sys" "$sys"
-		else
-			echo "警告: 下载 WinDivert 失败；Windows TUN TCP-only 运行时需要手动把 WinDivert.dll/WinDivert64.sys 放到 exe 同目录。" >&2
+		echo "==> 下载 WinDivert 2.2.2（嵌入 Windows exe）…"
+		if ! curl -fsSL "https://reqrypt.org/download/WinDivert-2.2.2-A.zip" -o "$tmp/windivert.zip"; then
+			rm -rf "$tmp"
+			echo "错误: 下载 WinDivert 失败" >&2
+			return 1
 		fi
+		if ! unzip -q "$tmp/windivert.zip" -d "$tmp"; then
+			rm -rf "$tmp"
+			echo "错误: 解压 WinDivert 失败" >&2
+			return 1
+		fi
+		local dll_src="$tmp/WinDivert-2.2.2-A/x64/WinDivert.dll"
+		local sys_src="$tmp/WinDivert-2.2.2-A/x64/WinDivert64.sys"
+		if [[ ! -f "$dll_src" || ! -f "$sys_src" ]]; then
+			rm -rf "$tmp"
+			echo "错误: WinDivert zip 中缺少 x64/WinDivert.dll 或 WinDivert64.sys" >&2
+			return 1
+		fi
+		mkdir -p "$vendor_dir"
+		cp "$dll_src" "$cache_dll"
+		cp "$sys_src" "$cache_sys"
 		rm -rf "$tmp"
 	fi
-	if [[ -f "$dll" && -f "$sys" ]]; then
-		cp "$dll" "$DIST/WinDivert.dll"
-		cp "$sys" "$DIST/WinDivert64.sys"
-	fi
+
+	mkdir -p "$embed_dir"
+	cp "$cache_dll" "$embed_dll"
+	cp "$cache_sys" "$embed_sys"
+	echo "    已写入 embed/WinDivert.dll + WinDivert64.sys（将打入 exe）"
 }
 
 build_macos() {
@@ -200,8 +228,9 @@ build_macos() {
 }
 
 build_windows_cross() {
+	clean_obsolete_windows_dist
 	ensure_app_icons
-	ensure_windivert_runtime
+	ensure_windivert_embed
 	local cc="${MINGW_CC:-}"
 	if [[ -z "$cc" ]]; then
 		cc="$(pick_mingw_cc)" || {
@@ -220,8 +249,9 @@ build_windows_cross() {
 }
 
 build_windows_native() {
+	clean_obsolete_windows_dist
 	ensure_app_icons
-	ensure_windivert_runtime
+	ensure_windivert_embed
 	echo "==> 编译 Windows amd64（本机）…"
 	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 \
 		go build -trimpath -ldflags="-s -w -H windowsgui" -o "$DIST/feizhu-client-ui-windows-amd64.exe" ./cmd/feizhu-client-ui

@@ -50,6 +50,9 @@ func restoreRoutes(c routeConfig) error {
 	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
 		_ = runDarwin("route", "-n", "delete", "-host", ip.String())
 	}
+	if c.DeviceName != "" {
+		_ = runDarwin("ifconfig", c.DeviceName, "down")
+	}
 	return nil
 }
 

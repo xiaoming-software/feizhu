@@ -5,6 +5,7 @@ package tunmode
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"net"
 	"os/exec"
 	"strconv"
@@ -13,6 +14,20 @@ import (
 )
 
 func defaultDeviceName() string { return "FeizhuTunnel" }
+
+// windowsBypassNets 与 macOS pf 表 <feizhu_bypass> 一致：这些目标走物理网卡，不进 TUN。
+// 尤其 127.0.0.0/8 必须旁路，否则本机 7890/7891 会被 /1 路由 hijack 到 TUN。
+var windowsBypassNets = []struct{ dest, mask string }{
+	{"0.0.0.0", "255.0.0.0"},
+	{"10.0.0.0", "255.0.0.0"},
+	{"100.64.0.0", "255.192.0.0"},
+	{"127.0.0.0", "255.0.0.0"},
+	{"169.254.0.0", "255.255.0.0"},
+	{"172.16.0.0", "255.240.0.0"},
+	{"192.168.0.0", "255.255.0.0"},
+	{"224.0.0.0", "240.0.0.0"},
+	{"240.0.0.0", "240.0.0.0"},
+}
 
 func captureRouteState(serverAddr string) (routeState, error) {
 	host, _, err := net.SplitHostPort(serverAddr)
@@ -45,22 +60,43 @@ func applyRoutes(c routeConfig) error {
 	if err != nil {
 		return err
 	}
-	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
-		_ = runWindows("route", "add", ip.String(), "mask", "255.255.255.255", c.State.Gateway.String(), "metric", "1", "if", strconv.Itoa(c.State.IfIndex))
+	physIf := strconv.Itoa(c.State.IfIndex)
+	gw := c.State.Gateway.String()
+
+	for _, n := range windowsBypassNets {
+		if err := runWindows("route", "add", n.dest, "mask", n.mask, gw, "metric", "5", "if", physIf); err != nil {
+			log.Printf("[TUN] 旁路路由 %s/%s（可忽略若已存在）: %v", n.dest, n.mask, err)
+		}
 	}
-	if err := runWindows("route", "add", "0.0.0.0", "mask", "128.0.0.0", c.AddressIP.String(), "metric", "1", "if", strconv.Itoa(tunIndex)); err != nil {
+	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
+		_ = runWindows("route", "add", ip.String(), "mask", "255.255.255.255", gw, "metric", "1", "if", physIf)
+	}
+	for _, ip := range c.BypassIPs {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		_ = runWindows("route", "add", ip, "mask", "255.255.255.255", gw, "metric", "1", "if", physIf)
+	}
+
+	tunIf := strconv.Itoa(tunIndex)
+	if err := runWindows("route", "add", "0.0.0.0", "mask", "128.0.0.0", c.AddressIP.String(), "metric", "1", "if", tunIf); err != nil {
 		return fmt.Errorf("tunmode: 添加 0.0.0.0/1 路由失败: %w", err)
 	}
-	if err := runWindows("route", "add", "128.0.0.0", "mask", "128.0.0.0", c.AddressIP.String(), "metric", "1", "if", strconv.Itoa(tunIndex)); err != nil {
+	if err := runWindows("route", "add", "128.0.0.0", "mask", "128.0.0.0", c.AddressIP.String(), "metric", "1", "if", tunIf); err != nil {
 		_ = runWindows("route", "delete", "0.0.0.0", "mask", "128.0.0.0")
 		return fmt.Errorf("tunmode: 添加 128.0.0.0/1 路由失败: %w", err)
 	}
+	log.Printf("[TUN] Windows 路由已安装：旁路私有/回环网段，其余 IPv4 默认走 %s（tun2socks）", c.DeviceName)
 	return nil
 }
 
 func restoreRoutes(c routeConfig) error {
 	_ = runWindows("route", "delete", "0.0.0.0", "mask", "128.0.0.0")
 	_ = runWindows("route", "delete", "128.0.0.0", "mask", "128.0.0.0")
+	for _, n := range windowsBypassNets {
+		_ = runWindows("route", "delete", n.dest, "mask", n.mask)
+	}
 	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
 		_ = runWindows("route", "delete", ip.String(), "mask", "255.255.255.255")
 	}

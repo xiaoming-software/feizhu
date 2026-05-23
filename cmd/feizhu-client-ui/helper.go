@@ -111,7 +111,9 @@ func startElevatedClient(cfg clientrunner.Config) (*elevatedProcess, error) {
 	cfg.AutoEnv = false
 	cfg.AutoCurlrc = false
 	cfg.TUN = true
-	cfg.SOCKS = true
+	if !cfg.SOCKS {
+		cfg.SOCKS = true
+	}
 	if err := curlrc.ClearManaged(); err != nil {
 		log.Printf("[TUN] 清理 ~/.curlrc 中旧的 feizhu 代理段失败: %v", err)
 	}
@@ -154,7 +156,9 @@ func waitElevatedHealthy(p *elevatedProcess) error {
 		if p.LogFile != "" {
 			if b, err := os.ReadFile(p.LogFile); err == nil {
 				lastLog = string(b)
-				if strings.Contains(lastLog, "[TUN] 已启用虚拟网卡透明代理模式") {
+				if strings.Contains(lastLog, "[TUN] 已启用虚拟网卡透明代理模式") ||
+					strings.Contains(lastLog, "[TUN] Windows TCP 透明代理已启用") ||
+					strings.Contains(lastLog, "[运行] SOCKS5 监听") {
 					return nil
 				}
 				if strings.Contains(lastLog, "[helper] clientrunner 退出:") {

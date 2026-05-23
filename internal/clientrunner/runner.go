@@ -126,13 +126,16 @@ func Run(ctx context.Context, cfg Config) error {
 		log.Printf("[启动] 远端登录校验成功 server=%s", cfg.ServerAddr)
 	}
 
-	ln, err := net.Listen("tcp", cfg.LocalListen)
+	var ln net.Listener
+	var socksLn net.Listener
+	var sh, sp string
+	var ph, pp string
+	var httpURL, socksURL string
+
+	ln, err = net.Listen("tcp", cfg.LocalListen)
 	if err != nil {
 		return fmt.Errorf("本地监听失败: %w", err)
 	}
-
-	var socksLn net.Listener
-	var sh, sp string
 	if cfg.SOCKS {
 		socksLn, err = net.Listen("tcp", cfg.SOCKSListen)
 		if err != nil {
@@ -151,7 +154,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("[TUN] TUN 模式依赖本地 SOCKS5，请保持 -socks=true")
 	}
 
-	ph, pp, err := sysproxy.ParseListenAddr(cfg.LocalListen)
+	ph, pp, err = sysproxy.ParseListenAddr(cfg.LocalListen)
 	if err != nil {
 		_ = ln.Close()
 		if socksLn != nil {
@@ -159,8 +162,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		return fmt.Errorf("-listen: %w", err)
 	}
-	httpURL := fmt.Sprintf("http://%s:%s", ph, pp)
-	var socksURL string
+	httpURL = fmt.Sprintf("http://%s:%s", ph, pp)
 	if cfg.SOCKS {
 		socksURL = fmt.Sprintf("socks5://%s:%s", sh, sp)
 	}
@@ -169,7 +171,9 @@ func Run(ctx context.Context, cfg Config) error {
 	if s := strings.TrimSpace(cfg.UpstreamProxy); s != "" {
 		upstream, err = upstreamproxy.Parse(s)
 		if err != nil {
-			_ = ln.Close()
+			if ln != nil {
+				_ = ln.Close()
+			}
 			if socksLn != nil {
 				_ = socksLn.Close()
 			}
@@ -197,9 +201,12 @@ func Run(ctx context.Context, cfg Config) error {
 			MTU:         cfg.TUNMTU,
 			SOCKSListen: cfg.SOCKSListen,
 			ServerAddr:  cfg.ServerAddr,
+			TunnelDial:  dialer.dialTUN,
 		})
 		if err != nil {
-			_ = ln.Close()
+			if ln != nil {
+				_ = ln.Close()
+			}
 			if socksLn != nil {
 				_ = socksLn.Close()
 			}
@@ -211,6 +218,7 @@ func Run(ctx context.Context, cfg Config) error {
 		} else {
 			log.Println("[TUN] 提示：curl -x 外部代理 的 TCP 也会被透明拦截；若外部代理仅允许家庭宽带 IP 认证，请在 feizhu 配置「上级代理」并让应用走 127.0.0.1:7890。")
 		}
+		log.Println("[TUN] 指纹浏览器可在配置里填远程代理地址（或留空走透明拦截）；上级代理只需在飞猪填写。TCP 将透明经 feizhu TLS 转发，浏览器内无需再填 127.0.0.1。")
 	}
 	defer func() {
 		if tunCtl != nil {
