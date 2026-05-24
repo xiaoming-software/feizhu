@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"time"
@@ -116,6 +117,9 @@ func serveFakeIPConnect(c net.Conn, host string, port uint16, dial DialFunc) err
 	}
 	if target == "" {
 		target = host
+	}
+	if target == host && isFakeIPv4(host) {
+		log.Printf("[socks5] fake-ip %s:%d 未能从首包解析域名，将按假 IP 拨号（易失败）", host, port)
 	}
 	rc, err := dial(target, port)
 	if err != nil {

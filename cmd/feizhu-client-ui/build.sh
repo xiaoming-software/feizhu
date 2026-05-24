@@ -140,9 +140,9 @@ clean_obsolete_windows_dist() {
 	rm -f "$DIST/WinDivert.dll" "$DIST/WinDivert64.sys" "$DIST/wintun.dll"
 }
 
-# 下载 WinDivert 并写入 internal/tunmode/embed/，供 go:embed 打进 Windows exe。
+# 下载 WinDivert 并写入 internal/platform/windows/tunmode/embed/，供 go:embed 打进 Windows exe。
 ensure_windivert_embed() {
-	local embed_dir="$ROOT/internal/tunmode/embed"
+	local embed_dir="$ROOT/internal/platform/windows/tunmode/embed"
 	local embed_dll="$embed_dir/WinDivert.dll"
 	local embed_sys="$embed_dir/WinDivert64.sys"
 	local vendor_dir="$SCRIPT_DIR/vendor/windivert"

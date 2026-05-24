@@ -446,36 +446,37 @@ func main() {
 				runMu.Lock()
 				elevatedChild = ep
 				runMu.Unlock()
+				// TUN 只负责拦截公网 TCP → feizhu TLS；系统代理仍按原先逻辑写入 7890/7891（与是否 TUN 无关）。
 				if err := sysproxy.Apply("127.0.0.1", "7890", "127.0.0.1", "7891", ""); err != nil {
-					logWriter.Write([]byte("[系统代理] TUN fallback 设置失败: " + err.Error() + "\n"))
+					logWriter.Write([]byte("[系统代理] 设置失败: " + err.Error() + "\n"))
 				} else {
 					runMu.Lock()
 					userProxyFallback = true
 					runMu.Unlock()
-					logWriter.Write([]byte("[系统代理] 已为当前用户启用 HTTP/HTTPS/SOCKS -> 127.0.0.1:7890/7891（浏览器 fallback）\n"))
+					logWriter.Write([]byte("[系统代理] 已启用 HTTP/HTTPS/SOCKS -> 127.0.0.1:7890/7891\n"))
 				}
 				if err := proxyenv.Apply(proxyenv.Config{
 					HTTPProxyURL:  "http://127.0.0.1:7890",
 					SOCKSProxyURL: "socks5://127.0.0.1:7891",
 					EnableSOCKS:   true,
 				}); err != nil {
-					logWriter.Write([]byte("[代理环境] TUN fallback 设置失败: " + err.Error() + "\n"))
+					logWriter.Write([]byte("[代理环境] 设置失败: " + err.Error() + "\n"))
 				} else {
 					runMu.Lock()
 					userEnvFallback = true
 					runMu.Unlock()
-					logWriter.Write([]byte("[代理环境] 已为新进程写入 127.0.0.1 代理变量\n"))
+					logWriter.Write([]byte("[代理环境] 已写入 http_proxy 等\n"))
 				}
 				if err := curlrc.Apply("http://127.0.0.1:7890"); err != nil {
-					logWriter.Write([]byte("[curl] TUN fallback 写入 ~/.curlrc 失败: " + err.Error() + "\n"))
+					logWriter.Write([]byte("[curl] 写入 ~/.curlrc 失败: " + err.Error() + "\n"))
 				} else {
 					runMu.Lock()
 					userCurlrcFallback = true
 					runMu.Unlock()
-					logWriter.Write([]byte("[curl] 已写入 ~/.curlrc fallback，普通 curl 也会走 127.0.0.1:7890\n"))
+					logWriter.Write([]byte("[curl] 已写入 ~/.curlrc\n"))
 				}
 				statusLabel.SetText(fmt.Sprintf("TUN helper 已通过系统授权启动（PID %d）", ep.PID))
-				logWriter.Write([]byte(fmt.Sprintf("[TUN] 已启动提权 helper PID=%d\n[TUN] helper 日志（排障必看）: %s\n[TUN] 日志含 [TUN-trace]/[TUN-debug]；AdsPower 测试后把 helper 日志发给我分析\n", ep.PID, ep.LogFile)))
+				logWriter.Write([]byte(fmt.Sprintf("[TUN] 已启动提权 helper PID=%d\n[TUN] helper 日志: %s\n", ep.PID, ep.LogFile)))
 				return
 			}
 

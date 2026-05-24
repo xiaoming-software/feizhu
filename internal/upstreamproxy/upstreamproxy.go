@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -46,6 +47,63 @@ func HostPort(u *url.URL) (string, error) {
 		return "", err
 	}
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
+}
+
+// TargetIsUpstream reports whether host:port is the upstream proxy itself (not a site behind it).
+func TargetIsUpstream(u *url.URL, host string, port uint16) bool {
+	if u == nil {
+		return false
+	}
+	upPort, err := proxyPort(u)
+	if err != nil {
+		return false
+	}
+	if port != upPort {
+		return false
+	}
+	upHost := u.Hostname()
+	if strings.EqualFold(host, upHost) {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if upIP := net.ParseIP(upHost); upIP != nil {
+			return ip.Equal(upIP)
+		}
+		ips, err := ResolvePublicIPv4(upHost)
+		if err != nil {
+			return false
+		}
+		for _, cand := range ips {
+			if ip.Equal(cand) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// BypassIPStrings returns IPv4 strings for TUN/pf bypass (upstream 主机名解析 + 字面 IP).
+func BypassIPStrings(u *url.URL) []string {
+	if u == nil {
+		return nil
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			return []string{ip4.String()}
+		}
+		return nil
+	}
+	ips, err := ResolvePublicIPv4(host)
+	if err != nil {
+		log.Printf("[上级代理] 解析旁路 IP 失败 host=%s: %v", host, err)
+		return nil
+	}
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, ip.String())
+	}
+	return out
 }
 
 func proxyPort(u *url.URL) (uint16, error) {
