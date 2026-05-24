@@ -33,9 +33,6 @@ func buildTCPBypassSet(cfg Config) map[uint32]struct{} {
 	for _, ip := range resolveIPv4Host(hostFromAddr(cfg.ServerAddr)) {
 		add(ip)
 	}
-	for _, ip := range append(windowsDNSIPs(), dohBypassIPs()...) {
-		add(ip)
-	}
 	for _, s := range cfg.BypassIPs {
 		if ip := net.ParseIP(strings.TrimSpace(s)); ip != nil {
 			add(ip)

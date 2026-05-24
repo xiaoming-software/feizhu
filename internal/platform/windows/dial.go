@@ -47,6 +47,9 @@ func (d *TunnelDialer) DialTUN(host string, port uint16) (net.Conn, error) {
 		if d.LogTUN {
 			log.Printf("[TUN-trace] 私网/链路本地 %s:%d 本机直连（不经 feizhu TLS）", host, port)
 		}
+		if port == 53 {
+			return dialDirectWithTimeout(host, port, 1200*time.Millisecond)
+		}
 		return dialDirect(host, port)
 	}
 	if d.Upstream != nil {
@@ -83,7 +86,11 @@ func isLocalDirectHost(host string) bool {
 }
 
 func dialDirect(host string, port uint16) (net.Conn, error) {
-	d := net.Dialer{Timeout: 15 * time.Second}
+	return dialDirectWithTimeout(host, port, 15*time.Second)
+}
+
+func dialDirectWithTimeout(host string, port uint16, timeout time.Duration) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout}
 	return d.Dial("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
 }
 

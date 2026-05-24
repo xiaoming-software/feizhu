@@ -14,13 +14,10 @@ func logWindowsTUNStartup(cfg Config) {
 	for _, ip := range resolveIPv4Host(hostFromAddr(cfg.ServerAddr)) {
 		ips = append(ips, ip.String())
 	}
-	for _, ip := range append(windowsDNSIPs(), dohBypassIPs()...) {
-		ips = append(ips, ip.String())
-	}
 	if len(ips) > 0 {
-		Tracef("旁路 IP（不进透明拦截）: %s", strings.Join(uniqueIPStrings(ips), ", "))
+		Tracef("服务端旁路 IP（不进透明拦截）: %s", strings.Join(uniqueIPStrings(ips), ", "))
 	}
-	Tracef("旁路表条目数=%d（含 DNS/服务端/显式 BypassIPs）", len(bypass))
+	Tracef("旁路表条目数=%d（含服务端/显式 BypassIPs；DNS 将走 TUN 内公共解析）", len(bypass))
 	Tracef("提示: 私有网段 10/8 172.16/12 192.168/16 默认旁路；AdsPower 代理若为内网 IP 则不会走 feizhu")
 }
 

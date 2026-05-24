@@ -24,7 +24,7 @@ func captureRouteState(serverAddr string) (routeState, error) {
 		Gateway:   gw,
 		Interface: iface,
 		ServerIPs: uniqueIPs(resolveIPv4Host(host)),
-		DNSIPs:    uniqueIPs(append(darwinDNSIPs(), dohBypassIPs()...)),
+		DNSIPs:    uniqueIPs(darwinDNSIPs()),
 	}, nil
 }
 
@@ -34,7 +34,7 @@ func applyRoutes(c routeConfig) error {
 	if err := runDarwin("ifconfig", c.DeviceName, "inet", c.AddressIP.String(), peer.String(), "netmask", mask, "mtu", fmt.Sprintf("%d", c.MTU), "up"); err != nil {
 		return fmt.Errorf("mactun: 配置 TUN 地址失败: %w", err)
 	}
-	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
+	for _, ip := range c.State.ServerIPs {
 		// 网络切换/异常退出后，旧 host route 可能仍指向旧网关；
 		// 先删再加，确保重启飞猪即可恢复，不必重启系统。
 		_ = runDarwin("route", "-n", "delete", "-host", ip.String())
@@ -48,7 +48,7 @@ func applyRoutes(c routeConfig) error {
 
 func restoreRoutes(c routeConfig) error {
 	_ = runDarwin("pfctl", "-a", "com.apple/feizhu", "-F", "all")
-	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
+	for _, ip := range c.State.ServerIPs {
 		_ = runDarwin("route", "-n", "delete", "-host", ip.String())
 	}
 	if c.DeviceName != "" {
@@ -64,12 +64,13 @@ func applyPF(c routeConfig, peer net.IP) error {
 		"169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
 		"224.0.0.0/4", "240.0.0.0/4",
 	)
-	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
+	for _, ip := range c.State.ServerIPs {
 		bypass = append(bypass, ip.String())
 	}
 	rules := fmt.Sprintf(`table <feizhu_bypass> const { %s }
+pass out quick route-to (%s %s) inet proto udp from any to any port 53 keep state
 pass out quick route-to (%s %s) inet proto tcp from any to ! <feizhu_bypass> flags S/SA keep state
-`, strings.Join(bypass, ", "), c.DeviceName, peer.String())
+`, strings.Join(bypass, ", "), c.DeviceName, peer.String(), c.DeviceName, peer.String())
 	path, err := writePFRules(rules)
 	if err != nil {
 		return err

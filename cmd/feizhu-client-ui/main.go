@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image/color"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -446,34 +447,54 @@ func main() {
 				runMu.Lock()
 				elevatedChild = ep
 				runMu.Unlock()
-				// TUN 只负责拦截公网 TCP → feizhu TLS；系统代理仍按原先逻辑写入 7890/7891（与是否 TUN 无关）。
-				if err := sysproxy.Apply("127.0.0.1", "7890", "127.0.0.1", "7891", ""); err != nil {
-					logWriter.Write([]byte("[系统代理] 设置失败: " + err.Error() + "\n"))
+				if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+					osName := "Windows"
+					if runtime.GOOS == "darwin" {
+						osName = "macOS"
+					}
+					if ok, err := sysproxy.RevertStaleFeizhuProxy(); err != nil {
+						logWriter.Write([]byte("[系统代理] " + osName + " 清理 feizhu 残留系统代理失败: " + err.Error() + "\n"))
+					} else if ok {
+						logWriter.Write([]byte("[系统代理] " + osName + " 已关闭 feizhu 残留系统代理；TUN 模式不再设置系统代理 fallback。\n"))
+					}
+					if ok, err := proxyenv.RevertStaleFeizhuEnv(); err != nil {
+						logWriter.Write([]byte("[代理环境] " + osName + " 清理 feizhu 残留环境变量失败: " + err.Error() + "\n"))
+					} else if ok {
+						logWriter.Write([]byte("[代理环境] " + osName + " 已清理 feizhu 残留代理环境变量。\n"))
+					}
+					if err := curlrc.ClearManaged(); err != nil {
+						logWriter.Write([]byte("[curl] " + osName + " 清理 feizhu curlrc 段失败: " + err.Error() + "\n"))
+					}
+					logWriter.Write([]byte("[TUN] " + osName + " 纯 TUN 模式：不设置系统代理/环境变量/curlrc，公网 TCP 与 DNS 由 TUN 透明进入 feizhu TLS。\n"))
 				} else {
-					runMu.Lock()
-					userProxyFallback = true
-					runMu.Unlock()
-					logWriter.Write([]byte("[系统代理] 已启用 HTTP/HTTPS/SOCKS -> 127.0.0.1:7890/7891\n"))
-				}
-				if err := proxyenv.Apply(proxyenv.Config{
-					HTTPProxyURL:  "http://127.0.0.1:7890",
-					SOCKSProxyURL: "socks5://127.0.0.1:7891",
-					EnableSOCKS:   true,
-				}); err != nil {
-					logWriter.Write([]byte("[代理环境] 设置失败: " + err.Error() + "\n"))
-				} else {
-					runMu.Lock()
-					userEnvFallback = true
-					runMu.Unlock()
-					logWriter.Write([]byte("[代理环境] 已写入 http_proxy 等\n"))
-				}
-				if err := curlrc.Apply("http://127.0.0.1:7890"); err != nil {
-					logWriter.Write([]byte("[curl] 写入 ~/.curlrc 失败: " + err.Error() + "\n"))
-				} else {
-					runMu.Lock()
-					userCurlrcFallback = true
-					runMu.Unlock()
-					logWriter.Write([]byte("[curl] 已写入 ~/.curlrc\n"))
+					if err := sysproxy.Apply("127.0.0.1", "7890", "127.0.0.1", "7891", ""); err != nil {
+						logWriter.Write([]byte("[系统代理] 设置失败: " + err.Error() + "\n"))
+					} else {
+						runMu.Lock()
+						userProxyFallback = true
+						runMu.Unlock()
+						logWriter.Write([]byte("[系统代理] 已启用 HTTP/HTTPS/SOCKS -> 127.0.0.1:7890/7891\n"))
+					}
+					if err := proxyenv.Apply(proxyenv.Config{
+						HTTPProxyURL:  "http://127.0.0.1:7890",
+						SOCKSProxyURL: "socks5://127.0.0.1:7891",
+						EnableSOCKS:   true,
+					}); err != nil {
+						logWriter.Write([]byte("[代理环境] 设置失败: " + err.Error() + "\n"))
+					} else {
+						runMu.Lock()
+						userEnvFallback = true
+						runMu.Unlock()
+						logWriter.Write([]byte("[代理环境] 已写入 http_proxy 等\n"))
+					}
+					if err := curlrc.Apply("http://127.0.0.1:7890"); err != nil {
+						logWriter.Write([]byte("[curl] 写入 ~/.curlrc 失败: " + err.Error() + "\n"))
+					} else {
+						runMu.Lock()
+						userCurlrcFallback = true
+						runMu.Unlock()
+						logWriter.Write([]byte("[curl] 已写入 ~/.curlrc\n"))
+					}
 				}
 				statusLabel.SetText(fmt.Sprintf("TUN helper 已通过系统授权启动（PID %d）", ep.PID))
 				logWriter.Write([]byte(fmt.Sprintf("[TUN] 已启动提权 helper PID=%d\n[TUN] helper 日志: %s\n", ep.PID, ep.LogFile)))

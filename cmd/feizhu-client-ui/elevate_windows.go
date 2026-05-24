@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 func startElevatedSelf(configPath string) (int, error) {
@@ -21,11 +22,13 @@ func startElevatedSelf(configPath string) (int, error) {
 		psArgs = append(psArgs, psQuote(arg))
 	}
 	script := fmt.Sprintf(
-		"$p = Start-Process -FilePath %s -ArgumentList @(%s) -Verb RunAs -PassThru; if ($p) { $p.Id }",
+		"$p = Start-Process -FilePath %s -ArgumentList @(%s) -Verb RunAs -WindowStyle Hidden -PassThru; if ($p) { $p.Id }",
 		psQuote(exe),
 		strings.Join(psArgs, ","),
 	)
-	out, err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script).Output()
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.Output()
 	if err != nil {
 		return 0, fmt.Errorf("请求管理员授权失败或已取消: %w", err)
 	}

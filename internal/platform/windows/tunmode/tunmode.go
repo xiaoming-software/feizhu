@@ -334,13 +334,6 @@ func uniqueIPs(ips []net.IP) []net.IP {
 	return out
 }
 
-func dohBypassIPs() []net.IP {
-	return []net.IP{
-		net.IPv4(1, 1, 1, 1),
-		net.IPv4(1, 0, 0, 1),
-	}
-}
-
 type routeState struct {
 	Gateway   net.IP
 	Interface string

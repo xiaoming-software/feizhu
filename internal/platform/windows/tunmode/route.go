@@ -8,10 +8,13 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 func defaultDeviceName() string { return "FeizhuTunnel" }
+
+var windowsTUNDNSServers = []string{"8.8.8.8", "1.1.1.1"}
 
 // windowsBypassNets 与 macOS pf 表 <feizhu_bypass> 一致：这些目标走物理网卡，不进 TUN。
 // 尤其 127.0.0.0/8 必须旁路，否则本机 7890/7891 会被 /1 路由 hijack 到 TUN。
@@ -41,7 +44,7 @@ func captureRouteState(serverAddr string) (routeState, error) {
 		Interface: ifName,
 		IfIndex:   ifIndex,
 		ServerIPs: uniqueIPs(resolveIPv4Host(host)),
-		DNSIPs:    uniqueIPs(append(windowsDNSIPs(), dohBypassIPs()...)),
+		DNSIPs:    uniqueIPs(windowsDNSIPsForInterface(ifIndex)),
 	}, nil
 }
 
@@ -58,6 +61,11 @@ func applyRoutes(c routeConfig) error {
 	if err != nil {
 		return err
 	}
+	if err := configureTUNDNS(c.DeviceName); err != nil {
+		log.Printf("[TUN] 配置 Windows TUN DNS 失败（Chrome 可能仍受本机 DNS 影响）: %v", err)
+	} else {
+		log.Printf("[TUN] Windows TUN DNS 已设置为 %s；DNS 查询将随 TUN 进入 feizhu TLS", strings.Join(windowsTUNDNSServers, ", "))
+	}
 	physIf := strconv.Itoa(c.State.IfIndex)
 	gw := c.State.Gateway.String()
 
@@ -71,7 +79,7 @@ func applyRoutes(c routeConfig) error {
 			log.Printf("[TUN] 旁路路由 %s/%s（可忽略若已存在）: %v", n.dest, n.mask, err)
 		}
 	}
-	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
+	for _, ip := range c.State.ServerIPs {
 		_ = runWindows("route", "delete", ip.String(), "mask", "255.255.255.255")
 		_ = runWindows("route", "add", ip.String(), "mask", "255.255.255.255", gw, "metric", "1", "if", physIf)
 	}
@@ -97,12 +105,13 @@ func applyRoutes(c routeConfig) error {
 }
 
 func restoreRoutes(c routeConfig) error {
+	_ = resetTUNDNS(c.DeviceName)
 	_ = runWindows("route", "delete", "0.0.0.0", "mask", "128.0.0.0")
 	_ = runWindows("route", "delete", "128.0.0.0", "mask", "128.0.0.0")
 	for _, n := range windowsBypassNets {
 		_ = runWindows("route", "delete", n.dest, "mask", n.mask)
 	}
-	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
+	for _, ip := range c.State.ServerIPs {
 		_ = runWindows("route", "delete", ip.String(), "mask", "255.255.255.255")
 	}
 	for _, ip := range c.BypassIPs {
@@ -117,7 +126,8 @@ func restoreRoutes(c routeConfig) error {
 
 func windowsDefaultRoute() (net.IP, int, string, error) {
 	script := `$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' } | Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1; if ($null -eq $r) { exit 2 }; $a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex; Write-Output "$($r.NextHop)|$($r.InterfaceIndex)|$($a.Name)"`
-	out, err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script).Output()
+	cmd := hiddenCommand("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, 0, "", fmt.Errorf("wintun: 获取默认路由失败: %w", err)
 	}
@@ -136,9 +146,10 @@ func windowsDefaultRoute() (net.IP, int, string, error) {
 	return gw, idx, parts[2], nil
 }
 
-func windowsDNSIPs() []net.IP {
-	script := `Get-DnsClientServerAddress -AddressFamily IPv4 | ForEach-Object { $_.ServerAddresses } | Sort-Object -Unique`
-	out, err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script).Output()
+func windowsDNSIPsForInterface(ifIndex int) []net.IP {
+	script := fmt.Sprintf(`Get-DnsClientServerAddress -InterfaceIndex %d -AddressFamily IPv4 | ForEach-Object { $_.ServerAddresses } | Sort-Object -Unique`, ifIndex)
+	cmd := hiddenCommand("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+	out, err := cmd.Output()
 	if err != nil {
 		return nil
 	}
@@ -151,6 +162,20 @@ func windowsDNSIPs() []net.IP {
 		}
 	}
 	return ips
+}
+
+func configureTUNDNS(deviceName string) error {
+	quoted := make([]string, 0, len(windowsTUNDNSServers))
+	for _, s := range windowsTUNDNSServers {
+		quoted = append(quoted, "'"+s+"'")
+	}
+	script := fmt.Sprintf(`Set-DnsClientServerAddress -InterfaceAlias %q -ServerAddresses @(%s)`, deviceName, strings.Join(quoted, ","))
+	return runWindows("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+}
+
+func resetTUNDNS(deviceName string) error {
+	script := fmt.Sprintf(`Set-DnsClientServerAddress -InterfaceAlias %q -ResetServerAddresses -ErrorAction SilentlyContinue`, deviceName)
+	return runWindows("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
 }
 
 func waitInterfaceIndex(name string) (int, error) {
@@ -169,7 +194,7 @@ func waitInterfaceIndex(name string) (int, error) {
 
 func runWindows(name string, args ...string) error {
 	var stderr bytes.Buffer
-	cmd := exec.Command(name, args...)
+	cmd := hiddenCommand(name, args...)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(stderr.String())
@@ -179,4 +204,10 @@ func runWindows(name string, args ...string) error {
 		return fmt.Errorf("%s %v: %w", name, args, err)
 	}
 	return nil
+}
+
+func hiddenCommand(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return cmd
 }

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -84,16 +85,10 @@ func Serve(c net.Conn, dial DialFunc) error {
 		return err
 	}
 
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(rc, c)
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(c, rc)
-		errc <- err
-	}()
-	<-errc
+	stats := relayWithStats(c, rc, port == 1000)
+	log.Printf("[socks5] relay target=%s:%d client_to_remote=%d remote_to_client=%d first_close=%s err=%v",
+		host, port, stats.clientToRemote, stats.remoteToClient, stats.firstDirection, stats.firstErr)
+	logRelaySample(host, port, stats)
 	return nil
 }
 
@@ -129,17 +124,101 @@ func serveFakeIPConnect(c net.Conn, host string, port uint16, dial DialFunc) err
 	if _, err := rc.Write(first); err != nil {
 		return err
 	}
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(rc, c)
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(c, rc)
-		errc <- err
-	}()
-	<-errc
+	stats := relayWithStats(c, rc, port == 1000)
+	stats.clientToRemote += int64(len(first))
+	log.Printf("[socks5] relay fake-ip target=%s:%d client_to_remote=%d remote_to_client=%d first_close=%s err=%v",
+		target, port, stats.clientToRemote, stats.remoteToClient, stats.firstDirection, stats.firstErr)
+	logRelaySample(target, port, stats)
 	return nil
+}
+
+type relayStats struct {
+	clientToRemote int64
+	remoteToClient int64
+	firstDirection string
+	firstErr       error
+	remoteSample   []byte
+}
+
+type copyResult struct {
+	direction string
+	n         int64
+	err       error
+	sample    []byte
+}
+
+func relayWithStats(client, remote net.Conn, captureRemoteSample bool) relayStats {
+	done := make(chan copyResult, 2)
+	go func() {
+		n, err := io.Copy(remote, client)
+		done <- copyResult{direction: "client_to_remote", n: n, err: err}
+	}()
+	go func() {
+		n, sample, err := copyWithOptionalSample(client, remote, captureRemoteSample, 512)
+		done <- copyResult{direction: "remote_to_client", n: n, err: err, sample: sample}
+	}()
+
+	first := <-done
+	_ = client.Close()
+	_ = remote.Close()
+	second := <-done
+
+	stats := relayStats{firstDirection: first.direction, firstErr: first.err}
+	for _, r := range []copyResult{first, second} {
+		switch r.direction {
+		case "client_to_remote":
+			stats.clientToRemote = r.n
+		case "remote_to_client":
+			stats.remoteToClient = r.n
+			stats.remoteSample = r.sample
+		}
+	}
+	return stats
+}
+
+func copyWithOptionalSample(dst io.Writer, src io.Reader, capture bool, limit int) (int64, []byte, error) {
+	if !capture || limit <= 0 {
+		n, err := io.Copy(dst, src)
+		return n, nil, err
+	}
+	buf := make([]byte, 32*1024)
+	var total int64
+	var sample []byte
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			chunk := buf[:nr]
+			if len(sample) < limit {
+				keep := limit - len(sample)
+				if keep > len(chunk) {
+					keep = len(chunk)
+				}
+				sample = append(sample, chunk[:keep]...)
+			}
+			nw, ew := dst.Write(chunk)
+			total += int64(nw)
+			if ew != nil {
+				return total, sample, ew
+			}
+			if nw != nr {
+				return total, sample, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er == io.EOF {
+				return total, sample, nil
+			}
+			return total, sample, er
+		}
+	}
+}
+
+func logRelaySample(host string, port uint16, stats relayStats) {
+	if len(stats.remoteSample) > 0 {
+		text := strings.ToValidUTF8(string(stats.remoteSample), "?")
+		log.Printf("[socks5] relay remote sample target=%s:%d utf8=%s hex=% x",
+			host, port, strconv.QuoteToASCII(text), stats.remoteSample)
+	}
 }
 
 func isFakeIPv4(host string) bool {

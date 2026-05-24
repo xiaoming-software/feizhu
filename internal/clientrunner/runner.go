@@ -217,7 +217,7 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			return fmt.Errorf("[TUN] 启动失败: %w", err)
 		}
-		log.Println("[TUN] 已启用虚拟网卡透明代理模式；TCP 流量将经本地 SOCKS5 再进入 feizhu TLS 隧道，UDP 暂不转发。")
+		log.Println("[TUN] 已启用虚拟网卡透明代理模式；TCP 流量将经本地 SOCKS5 再进入 feizhu TLS 隧道，DNS UDP/53 会转为隧道内 TCP 查询。")
 		logTUNPlatformMessages(upstream != nil)
 	}
 	defer func() {

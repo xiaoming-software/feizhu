@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // CleanupStale 向临时目录下所有 helper stop 文件发停止信号，结束可能残留的提权 TUN 进程。
@@ -33,17 +34,26 @@ func CleanupStale() (bool, error) {
 
 func cleanupStaleRoutes() bool {
 	changed := false
+	if resetTUNDNS(defaultDeviceName()) == nil {
+		changed = true
+	}
 	for _, args := range [][]string{
 		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0"},
 		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0"},
 	} {
-		if exec.Command(args[0], args[1:]...).Run() == nil {
+		if hiddenCleanupCommand(args[0], args[1:]...).Run() == nil {
 			changed = true
 		}
 	}
 	script := `Get-NetRoute -InterfaceAlias 'FeizhuTunnel' -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1') } | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue`
-	if exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script).Run() == nil {
+	if hiddenCleanupCommand("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script).Run() == nil {
 		changed = true
 	}
 	return changed
+}
+
+func hiddenCleanupCommand(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return cmd
 }
