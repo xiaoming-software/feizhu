@@ -16,7 +16,7 @@ func Start(ctx context.Context, cfg Config) (*Controller, error) {
 	return mactun.Start(ctx, mactun.Config(cfg))
 }
 
-// CleanupStale 清理异常退出残留的 pf 规则。
+// CleanupStale 清理异常退出残留的 helper、pf 与 TUN 状态。
 func CleanupStale() (bool, error) {
 	return mactun.CleanupStale()
 }

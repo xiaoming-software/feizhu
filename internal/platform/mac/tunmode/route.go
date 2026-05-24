@@ -24,7 +24,8 @@ func captureRouteState(serverAddr string) (routeState, error) {
 		Gateway:   gw,
 		Interface: iface,
 		ServerIPs: uniqueIPs(resolveIPv4Host(host)),
-		DNSIPs:    uniqueIPs(darwinDNSIPs()),
+		// 仅用于检测网络/DNS 变化后刷新路由，不参与旁路表。
+		DNSIPs: uniqueIPs(darwinDNSIPsForInterface(iface)),
 	}, nil
 }
 
@@ -35,8 +36,7 @@ func applyRoutes(c routeConfig) error {
 		return fmt.Errorf("mactun: 配置 TUN 地址失败: %w", err)
 	}
 	for _, ip := range c.State.ServerIPs {
-		// 网络切换/异常退出后，旧 host route 可能仍指向旧网关；
-		// 先删再加，确保重启飞猪即可恢复，不必重启系统。
+		// 网络切换/异常退出后，旧 host route 可能仍指向旧网关；先删再加。
 		_ = runDarwin("route", "-n", "delete", "-host", ip.String())
 		_ = runDarwin("route", "-n", "add", "-host", ip.String(), c.State.Gateway.String())
 	}
@@ -67,6 +67,7 @@ func applyPF(c routeConfig, peer net.IP) error {
 	for _, ip := range c.State.ServerIPs {
 		bypass = append(bypass, ip.String())
 	}
+	// macOS 无 Windows 式 0.0.0.0/1 路由，公网 TCP 与 DNS(UDP/53) 均靠 pf route-to 进 TUN。
 	rules := fmt.Sprintf(`table <feizhu_bypass> const { %s }
 pass out quick route-to (%s %s) inet proto udp from any to any port 53 keep state
 pass out quick route-to (%s %s) inet proto tcp from any to ! <feizhu_bypass> flags S/SA keep state
@@ -77,7 +78,7 @@ pass out quick route-to (%s %s) inet proto tcp from any to ! <feizhu_bypass> fla
 	}
 	defer os.Remove(path)
 	if err := runDarwin("pfctl", "-a", "com.apple/feizhu", "-f", path); err != nil {
-		return fmt.Errorf("mactun: 加载 TCP-only pf 规则失败: %w", err)
+		return fmt.Errorf("mactun: 加载 pf 规则失败: %w", err)
 	}
 	if err := runDarwin("pfctl", "-E"); err != nil && !strings.Contains(err.Error(), "pf already enabled") {
 		return fmt.Errorf("mactun: 启用 pf 失败: %w", err)
@@ -124,6 +125,55 @@ func darwinDefaultRoute() (net.IP, string, error) {
 		return nil, "", fmt.Errorf("mactun: 无法解析默认路由 gateway/interface")
 	}
 	return gw, iface, nil
+}
+
+// darwinDNSIPsForInterface 仅用于 refresh 时比较 DNS 是否变化（与 Windows 同类检测，不改 mac 引流路径）。
+func darwinDNSIPsForInterface(iface string) []net.IP {
+	service := networkServiceForInterface(iface)
+	if service == "" {
+		return darwinDNSIPs()
+	}
+	out, err := exec.Command("networksetup", "-getdnsservers", service).Output()
+	if err != nil {
+		return darwinDNSIPs()
+	}
+	text := strings.TrimSpace(string(out))
+	if text == "" || strings.Contains(text, "There aren't any DNS Servers") {
+		return darwinDNSIPs()
+	}
+	var ips []net.IP
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if ip := net.ParseIP(line); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				ips = append(ips, ip4)
+			}
+		}
+	}
+	if len(ips) == 0 {
+		return darwinDNSIPs()
+	}
+	return ips
+}
+
+func networkServiceForInterface(iface string) string {
+	out, err := exec.Command("networksetup", "-listallhardwareports").Output()
+	if err != nil {
+		return ""
+	}
+	for _, block := range strings.Split(string(out), "\n\n") {
+		if !strings.Contains(block, "Device: "+iface) {
+			continue
+		}
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Hardware Port:") {
+				return strings.TrimSpace(strings.TrimPrefix(line, "Hardware Port:"))
+			}
+		}
+		break
+	}
+	return ""
 }
 
 func darwinDNSIPs() []net.IP {
