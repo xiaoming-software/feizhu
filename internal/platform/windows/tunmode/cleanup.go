@@ -2,6 +2,7 @@ package wintun
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -12,7 +13,7 @@ func CleanupStale() (bool, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			return cleanupStaleRoutes(), nil
 		}
 		return false, err
 	}
@@ -26,5 +27,23 @@ func CleanupStale() (bool, error) {
 			n++
 		}
 	}
-	return n > 0, nil
+	routeCleaned := cleanupStaleRoutes()
+	return n > 0 || routeCleaned, nil
+}
+
+func cleanupStaleRoutes() bool {
+	changed := false
+	for _, args := range [][]string{
+		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0"},
+		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0"},
+	} {
+		if exec.Command(args[0], args[1:]...).Run() == nil {
+			changed = true
+		}
+	}
+	script := `Get-NetRoute -InterfaceAlias 'FeizhuTunnel' -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1') } | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue`
+	if exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script).Run() == nil {
+		changed = true
+	}
+	return changed
 }

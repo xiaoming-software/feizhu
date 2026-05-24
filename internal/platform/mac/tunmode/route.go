@@ -35,6 +35,9 @@ func applyRoutes(c routeConfig) error {
 		return fmt.Errorf("mactun: 配置 TUN 地址失败: %w", err)
 	}
 	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
+		// 网络切换/异常退出后，旧 host route 可能仍指向旧网关；
+		// 先删再加，确保重启飞猪即可恢复，不必重启系统。
+		_ = runDarwin("route", "-n", "delete", "-host", ip.String())
 		_ = runDarwin("route", "-n", "add", "-host", ip.String(), c.State.Gateway.String())
 	}
 	if err := applyPF(c, peer); err != nil {

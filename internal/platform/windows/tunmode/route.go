@@ -61,12 +61,18 @@ func applyRoutes(c routeConfig) error {
 	physIf := strconv.Itoa(c.State.IfIndex)
 	gw := c.State.Gateway.String()
 
+	// 旧实例异常退出时 /1 路由可能仍在，先删再建，避免 route add 因已存在而失败。
+	_ = runWindows("route", "delete", "0.0.0.0", "mask", "128.0.0.0")
+	_ = runWindows("route", "delete", "128.0.0.0", "mask", "128.0.0.0")
+
 	for _, n := range windowsBypassNets {
+		_ = runWindows("route", "delete", n.dest, "mask", n.mask)
 		if err := runWindows("route", "add", n.dest, "mask", n.mask, gw, "metric", "5", "if", physIf); err != nil {
 			log.Printf("[TUN] 旁路路由 %s/%s（可忽略若已存在）: %v", n.dest, n.mask, err)
 		}
 	}
 	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
+		_ = runWindows("route", "delete", ip.String(), "mask", "255.255.255.255")
 		_ = runWindows("route", "add", ip.String(), "mask", "255.255.255.255", gw, "metric", "1", "if", physIf)
 	}
 	for _, ip := range c.BypassIPs {
@@ -74,6 +80,7 @@ func applyRoutes(c routeConfig) error {
 		if ip == "" {
 			continue
 		}
+		_ = runWindows("route", "delete", ip, "mask", "255.255.255.255")
 		_ = runWindows("route", "add", ip, "mask", "255.255.255.255", gw, "metric", "1", "if", physIf)
 	}
 
@@ -97,6 +104,13 @@ func restoreRoutes(c routeConfig) error {
 	}
 	for _, ip := range append(c.State.ServerIPs, c.State.DNSIPs...) {
 		_ = runWindows("route", "delete", ip.String(), "mask", "255.255.255.255")
+	}
+	for _, ip := range c.BypassIPs {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		_ = runWindows("route", "delete", ip, "mask", "255.255.255.255")
 	}
 	return nil
 }

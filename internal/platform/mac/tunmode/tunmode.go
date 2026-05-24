@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/feizhu/feizhu/internal/socks5"
 	"github.com/xjasonlyu/tun2socks/v2/core"
@@ -46,6 +47,7 @@ type Controller struct {
 	device   device.Device
 	stack    *stack.Stack
 	stopFunc func()
+	routeMu  sync.Mutex
 	stopOnce sync.Once
 }
 
@@ -56,6 +58,9 @@ func Start(ctx context.Context, cfg Config) (*Controller, error) {
 	}
 	cfg = withDefaults(cfg)
 	initTUNDebugFromEnv(cfg)
+	// 上次异常退出或系统睡眠/网络切换后，pf anchor 可能还残留。
+	// 在提权 helper 内启动前先清一次，避免旧状态影响本次路由。
+	_, _ = CleanupStale()
 	if cfg.SOCKSListen == "" {
 		return nil, fmt.Errorf("mactun: SOCKSListen 为空")
 	}
@@ -128,9 +133,56 @@ func startTUNStack(ctx context.Context, cfg Config) (*Controller, error) {
 
 func (c *Controller) startWatcher(ctx context.Context) {
 	go func() {
-		<-ctx.Done()
-		c.Stop()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				c.Stop()
+				return
+			case <-ticker.C:
+				c.refreshRoutesIfNeeded()
+			}
+		}
 	}()
+}
+
+func (c *Controller) refreshRoutesIfNeeded() {
+	c.routeMu.Lock()
+	defer c.routeMu.Unlock()
+
+	next, err := captureRouteState(c.cfg.ServerAddr)
+	if err != nil {
+		log.Printf("[TUN] 检查默认网络变化失败: %v", err)
+		return
+	}
+	if routeStateEqual(c.route, next) {
+		return
+	}
+	log.Printf("[TUN] 检测到默认网络变化，刷新 macOS TUN 路由：%s/%s -> %s/%s", c.route.Gateway, c.route.Interface, next.Gateway, next.Interface)
+	_ = restoreRoutes(routeConfig{
+		DeviceName: c.cfg.DeviceName,
+		State:      c.route,
+	})
+	addr, ip, prefix, err := parseAddressCIDR(c.cfg.AddressCIDR)
+	if err != nil {
+		log.Printf("[TUN] 刷新路由失败: %v", err)
+		return
+	}
+	if err := applyRoutes(routeConfig{
+		DeviceName:  c.cfg.DeviceName,
+		AddressCIDR: addr,
+		AddressIP:   ip,
+		Netmask:     net.CIDRMask(prefix, 32),
+		PrefixLen:   prefix,
+		MTU:         c.cfg.MTU,
+		State:       next,
+		BypassIPs:   c.cfg.BypassIPs,
+	}); err != nil {
+		log.Printf("[TUN] 刷新路由失败: %v", err)
+		return
+	}
+	c.route = next
 }
 
 // Stop 还原 pf/路由并关闭 TUN。
@@ -139,6 +191,8 @@ func (c *Controller) Stop() {
 		return
 	}
 	c.stopOnce.Do(func() {
+		c.routeMu.Lock()
+		defer c.routeMu.Unlock()
 		if c.stopFunc != nil {
 			c.stopFunc()
 		}
@@ -153,6 +207,31 @@ func (c *Controller) Stop() {
 		}
 		closeDevice(c.device)
 	})
+}
+
+func routeStateEqual(a, b routeState) bool {
+	return a.Gateway.Equal(b.Gateway) &&
+		a.Interface == b.Interface &&
+		ipListEqual(a.ServerIPs, b.ServerIPs) &&
+		ipListEqual(a.DNSIPs, b.DNSIPs)
+}
+
+func ipListEqual(a, b []net.IP) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, ip := range a {
+		seen[ip.String()]++
+	}
+	for _, ip := range b {
+		s := ip.String()
+		if seen[s] == 0 {
+			return false
+		}
+		seen[s]--
+	}
+	return true
 }
 
 func withDefaults(c Config) Config {
