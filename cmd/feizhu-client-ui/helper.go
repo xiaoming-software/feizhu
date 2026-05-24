@@ -150,7 +150,9 @@ func waitElevatedHealthy(p *elevatedProcess) error {
 	if p == nil {
 		return fmt.Errorf("helper 进程为空")
 	}
-	deadline := time.Now().Add(6 * time.Second)
+	// 首次安装/加载 wintun、创建虚拟网卡在部分 Windows 机器上会超过 6 秒。
+	// 等待时间过短会把仍在启动中的 helper 误判为失败并主动停止。
+	deadline := time.Now().Add(30 * time.Second)
 	var lastLog string
 	for time.Now().Before(deadline) {
 		if p.LogFile != "" {

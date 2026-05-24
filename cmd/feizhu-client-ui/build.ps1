@@ -35,7 +35,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 $Dist = Join-Path $ScriptDir "dist"
 $Assets = Join-Path $ScriptDir "assets"
-$EmbedDir = Join-Path $Root "internal\tunmode\embed"
+$EmbedDir = Join-Path $Root "internal\platform\windows\tunmode\embed"
 $VendorDir = Join-Path $ScriptDir "vendor\windivert"
 $DefaultOut = Join-Path $Dist "feizhu-client-ui-windows-amd64.exe"
 
@@ -162,7 +162,7 @@ function Ensure-WinDivertEmbed {
     New-Item -ItemType Directory -Path $EmbedDir -Force | Out-Null
     Copy-Item $cacheDll $embedDll -Force
     Copy-Item $cacheSys $embedSys -Force
-    Write-Ok "Copied WinDivert into internal\tunmode\embed (go:embed)"
+    Write-Ok "Copied WinDivert into internal\platform\windows\tunmode\embed (go:embed)"
 }
 
 function Ensure-WintunEmbed {
@@ -201,7 +201,7 @@ function Ensure-WintunEmbed {
 
     New-Item -ItemType Directory -Path $EmbedDir -Force | Out-Null
     Copy-Item $cacheDll $embedDll -Force
-    Write-Ok "Copied wintun.dll into internal\tunmode\embed (go:embed)"
+    Write-Ok "Copied wintun.dll into internal\platform\windows\tunmode\embed (go:embed)"
 }
 
 function Ensure-WindowsIcon {
