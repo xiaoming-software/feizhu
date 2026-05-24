@@ -29,6 +29,7 @@ func main() {
 	tunDevice := flag.String("tun-device", "", "TUN 网卡名称；macOS 默认 utun123，Windows 默认 FeizhuTunnel")
 	tunAddress := flag.String("tun-address", "10.255.0.1/30", "TUN 网卡 IPv4 地址/CIDR")
 	tunMTU := flag.Int("tun-mtu", 1500, "TUN 网卡 MTU")
+	tunDebug := flag.Bool("tun-debug", false, "TUN/WinDivert 排障详细日志（旁路原因、流表）；等价 FEIZHU_TUN_DEBUG=1")
 	upstreamProxy := flag.String("upstream-proxy", "", "上级 HTTP/SOCKS5 代理 URL（如 http://user:pass@15.235.183.47:2000）；本地 7890/7891 经此转发，TUN 时该 IP 旁路直连")
 	printProxyEnv := flag.Bool("print-proxy-env", false, "仅打印终端用 http(s)_proxy 等环境变量脚本并退出（无需 -server/-password）")
 	flag.Parse()
@@ -64,6 +65,7 @@ func main() {
 		TUNDevice:      *tunDevice,
 		TUNAddress:     *tunAddress,
 		TUNMTU:         *tunMTU,
+		TUNDebug:       *tunDebug,
 		UpstreamProxy:  *upstreamProxy,
 	}
 

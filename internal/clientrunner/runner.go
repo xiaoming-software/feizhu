@@ -48,6 +48,7 @@ type Config struct {
 	TUNDevice      string
 	TUNAddress     string
 	TUNMTU         int
+	TUNDebug       bool
 	// UpstreamProxy 为本地 HTTP/SOCKS 出口链路上级（http/socks5 URL）。
 	// 配置后：经 127.0.0.1:7890/7891 的流量走该上级；其 IP 在 TUN 模式下加入 pf 旁路以便本机直连认证。
 	UpstreamProxy string
@@ -187,6 +188,7 @@ func Run(ctx context.Context, cfg Config) error {
 		serverAddr: cfg.ServerAddr,
 		password:   cfg.Password,
 		tlsCfg:     tlsCfg,
+		logTUN:     cfg.TUN,
 	}
 
 	var tunCtl *tunmode.Controller
@@ -200,7 +202,9 @@ func Run(ctx context.Context, cfg Config) error {
 			AddressCIDR: cfg.TUNAddress,
 			MTU:         cfg.TUNMTU,
 			SOCKSListen: cfg.SOCKSListen,
+			LocalListen: cfg.LocalListen,
 			ServerAddr:  cfg.ServerAddr,
+			TUNDebug:    cfg.TUNDebug,
 			TunnelDial:  dialer.dialTUN,
 		})
 		if err != nil {
@@ -219,6 +223,15 @@ func Run(ctx context.Context, cfg Config) error {
 			log.Println("[TUN] 提示：curl -x 外部代理 的 TCP 也会被透明拦截；若外部代理仅允许家庭宽带 IP 认证，请在 feizhu 配置「上级代理」并让应用走 127.0.0.1:7890。")
 		}
 		log.Println("[TUN] 指纹浏览器可在配置里填远程代理地址（或留空走透明拦截）；上级代理只需在飞猪填写。TCP 将透明经 feizhu TLS 转发，浏览器内无需再填 127.0.0.1。")
+		if runtime.GOOS == "windows" {
+			log.Println("[TUN] Windows：透明拦截经 wintun+tun2socks -> 本地 SOCKS5 -> feizhu TLS（与 macOS 同路径）。")
+			log.Println("[TUN] Windows 备选（最可靠）：AdsPower 代理类型选 SOCKS5，地址 127.0.0.1:7891，远程代理留空；若需经第三方代理出口，在飞猪填「上级代理」。")
+			if cfg.TUNDebug {
+				log.Println("[TUN] 已开启 TUN 排障详细日志；连接级 [TUN-trace] 默认输出，旁路/流表见 [TUN-debug]。可设 FEIZHU_TUN_DEBUG=1")
+			} else {
+				log.Println("[TUN] 排障提示：勾选「TUN 排障详细日志」或设置环境变量 FEIZHU_TUN_DEBUG=1 后重启，可输出旁路原因与流表")
+			}
+		}
 	}
 	defer func() {
 		if tunCtl != nil {
@@ -407,9 +420,16 @@ type targetDialer struct {
 	serverAddr string
 	password   string
 	tlsCfg     *tls.Config
+	logTUN     bool
 }
 
 func (d *targetDialer) dialLocal(host string, port uint16) (net.Conn, error) {
+	if isLoopbackHost(host) {
+		return dialLoopback(host, port)
+	}
+	if isLocalDirectHost(host) {
+		return dialDirect(host, port)
+	}
 	if d.upstream != nil {
 		return upstreamproxy.DialVia(d.upstream, host, port, d.connectViaTunnel)
 	}
@@ -417,6 +437,16 @@ func (d *targetDialer) dialLocal(host string, port uint16) (net.Conn, error) {
 }
 
 func (d *targetDialer) dialTUN(host string, port uint16) (net.Conn, error) {
+	if isLoopbackHost(host) {
+		return dialLoopback(host, port)
+	}
+	// Windows tun2socks 可能仍把路由器/DNS 等私网 TCP 送进 SOCKS；必须本机直连，不能经远端 server 拨号。
+	if isLocalDirectHost(host) {
+		if d.logTUN {
+			log.Printf("[TUN-trace] 私网/链路本地 %s:%d 本机直连（不经 feizhu TLS）", host, port)
+		}
+		return dialDirect(host, port)
+	}
 	if d.upstream != nil {
 		return upstreamproxy.DialVia(d.upstream, host, port, d.connectViaTunnel)
 	}
@@ -430,7 +460,9 @@ func (d *targetDialer) connectViaTunnel(host string, port uint16) (net.Conn, err
 func handleSOCKS(client net.Conn, dialer *targetDialer, suppressPerConn, fromTUN bool) {
 	sid := tunnelSeq.Add(1)
 	peer := client.RemoteAddr().String()
-	if !suppressPerConn {
+	if fromTUN {
+		log.Printf("[TUN-trace] [socks #%d] 来自透明拦截 peer=%s", sid, peer)
+	} else if !suppressPerConn {
 		log.Printf("[socks #%d] 连接 %s", sid, peer)
 	}
 	dialFn := dialer.dialLocal
@@ -444,13 +476,25 @@ func handleSOCKS(client net.Conn, dialer *targetDialer, suppressPerConn, fromTUN
 		via = "上级代理"
 	}
 	err := socks5.Serve(client, func(host string, port uint16) (net.Conn, error) {
-		if !suppressPerConn {
+		if fromTUN {
+			log.Printf("[TUN-trace] [socks #%d] CONNECT %s:%d（经 %s）", sid, host, port, via)
+		} else if !suppressPerConn {
 			log.Printf("[socks #%d] 请求 CONNECT %s:%d（经 %s）", sid, host, port, via)
 		}
-		return dialFn(host, port)
+		conn, err := dialFn(host, port)
+		if err != nil && fromTUN {
+			log.Printf("[TUN-trace] [socks #%d] 拨号失败 %s:%d: %v", sid, host, port, err)
+		}
+		return conn, err
 	})
 	if err != nil {
-		log.Printf("[socks #%d] 结束 %s err=%v", sid, peer, err)
+		if fromTUN {
+			log.Printf("[TUN-trace] [socks #%d] 结束 %s err=%v", sid, peer, err)
+		} else {
+			log.Printf("[socks #%d] 结束 %s err=%v", sid, peer, err)
+		}
+	} else if fromTUN {
+		log.Printf("[TUN-trace] [socks #%d] 正常结束 %s", sid, peer)
 	} else if !suppressPerConn {
 		log.Printf("[socks #%d] 结束 %s", sid, peer)
 	}
@@ -599,23 +643,58 @@ func handleHTTP(client net.Conn, br *bufio.Reader, req *http.Request, dialer *ta
 	return nil
 }
 
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// isLocalDirectHost 为 RFC1918、链路本地等应在本机物理网卡直连的地址（不经 feizhu 远端拨号）。
+func isLocalDirectHost(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	return ip4.IsPrivate() || ip4.IsLinkLocalUnicast()
+}
+
+func dialDirect(host string, port uint16) (net.Conn, error) {
+	d := net.Dialer{Timeout: 15 * time.Second}
+	return d.Dial("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
+}
+
+func dialLoopback(host string, port uint16) (net.Conn, error) {
+	h := host
+	if strings.EqualFold(host, "localhost") {
+		h = "127.0.0.1"
+	}
+	d := net.Dialer{Timeout: 15 * time.Second}
+	return d.Dial("tcp", net.JoinHostPort(h, fmt.Sprintf("%d", port)))
+}
+
 func dialTunnel(serverAddr, password string, tlsCfg *tls.Config, host string, port uint16) (*tls.Conn, error) {
 	d := net.Dialer{Timeout: 15 * time.Second}
 	raw, err := d.Dial("tcp", serverAddr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("连接服务端 %s: %w", serverAddr, err)
 	}
 	tlsConn := tls.Client(raw, tlsCfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		raw.Close()
-		return nil, err
+		return nil, fmt.Errorf("TLS 握手 server=%s: %w", serverAddr, err)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	if err := tunnel.ClientHandshake(tlsConn, password, host, port, deadline); err != nil {
 		tlsConn.Close()
-		return nil, err
+		return nil, fmt.Errorf("FZ1 拨号 %s:%d: %w", host, port, err)
 	}
 	return tlsConn, nil
 }

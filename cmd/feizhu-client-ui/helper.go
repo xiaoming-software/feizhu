@@ -156,8 +156,8 @@ func waitElevatedHealthy(p *elevatedProcess) error {
 		if p.LogFile != "" {
 			if b, err := os.ReadFile(p.LogFile); err == nil {
 				lastLog = string(b)
-				if strings.Contains(lastLog, "[TUN] 已启用虚拟网卡透明代理模式") ||
-					strings.Contains(lastLog, "[TUN] Windows TCP 透明代理已启用") ||
+				if strings.Contains(lastLog, "[TUN] Windows wintun+tun2socks 已启动") ||
+					strings.Contains(lastLog, "[TUN] 已启用虚拟网卡透明代理模式") ||
 					strings.Contains(lastLog, "[运行] SOCKS5 监听") {
 					return nil
 				}

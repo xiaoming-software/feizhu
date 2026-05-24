@@ -5,9 +5,9 @@ package tunmode
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,8 +16,6 @@ import (
 )
 
 const tcpRedirectMapTTL = 2 * time.Minute
-
-var redirectLocalIP = net.IPv4(127, 0, 0, 1)
 
 type tcpFlowKey struct {
 	ip   string
@@ -33,6 +31,7 @@ type tcpOriginalTarget struct {
 type tcpRedirector struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
+	socksAddr  string
 	tunnelDial socks5.DialFunc
 	listener   net.Listener
 	divert     *godivert.WinDivertHandle
@@ -43,22 +42,27 @@ type tcpRedirector struct {
 }
 
 func startWindowsTCPRedirect(ctx context.Context, cfg Config) (*Controller, error) {
-	if cfg.TunnelDial == nil {
-		return nil, fmt.Errorf("tunmode: Windows 透明代理需要 TunnelDial")
+	if cfg.SOCKSListen == "" {
+		return nil, fmt.Errorf("tunmode: Windows 透明代理需要 SOCKSListen")
+	}
+	socksAddr, err := socksProxyAddress(cfg.SOCKSListen)
+	if err != nil {
+		return nil, err
 	}
 	childCtx, cancel := context.WithCancel(ctx)
 	r := &tcpRedirector{
 		ctx:        childCtx,
 		cancel:     cancel,
+		socksAddr:  socksAddr,
 		tunnelDial: cfg.TunnelDial,
 		bypass:     buildTCPBypassSet(cfg),
 		flows:      make(map[tcpFlowKey]tcpOriginalTarget),
 	}
-	if err := r.start(); err != nil {
+	if err := r.start(cfg); err != nil {
 		cancel()
 		return nil, err
 	}
-	log.Printf("[TUN] Windows TCP 透明代理（WinDivert）：仅拦截出站 TCP -> feizhu TLS；UDP/DNS 不拦截（与 macOS pf 一致）")
+	log.Printf("[TUN] Windows WinDivert 透明代理：出站 TCP -> 本地 SOCKS5 %s -> feizhu TLS（与 macOS 路径一致）", socksAddr)
 	return &Controller{
 		cfg: cfg,
 		stopFunc: func() {
@@ -67,18 +71,24 @@ func startWindowsTCPRedirect(ctx context.Context, cfg Config) (*Controller, erro
 	}, nil
 }
 
-func (r *tcpRedirector) start() error {
+func (r *tcpRedirector) start(cfg Config) error {
 	if err := ensureWinDivertLoaded(); err != nil {
 		return err
 	}
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	// 必须监听所有接口：WinDivert 改写的目标为本机出网 IP（如 192.168.x.x），
+	// 若只绑 127.0.0.1，源为 LAN IP 的包无法完成 TCP 握手（accept 永远为 0）。
+	ln, err := net.Listen("tcp4", "0.0.0.0:0")
 	if err != nil {
 		return fmt.Errorf("tunmode: 透明代理监听失败: %w", err)
 	}
 	r.listener = ln
 	redirectPort := uint16(ln.Addr().(*net.TCPAddr).Port)
 
-	filter := buildWinDivertFilter(redirectPort)
+	skipPorts := []uint16{
+		parseListenPort(cfg.SOCKSListen),
+		parseListenPort(cfg.LocalListen),
+	}
+	filter := buildWinDivertFilter(redirectPort, skipPorts)
 	if err := validateWinDivertFilter(filter); err != nil {
 		_ = ln.Close()
 		return err
@@ -122,7 +132,11 @@ func (r *tcpRedirector) packetLoop(redirectPort uint16) {
 			log.Printf("[TUN] WinDivert recv: %v", err)
 			continue
 		}
-		if err := r.rewritePacket(p, redirectPort); err != nil {
+		drop, err := r.rewritePacket(p, redirectPort)
+		if err != nil {
+			if drop {
+				continue
+			}
 			log.Printf("[TUN] WinDivert rewrite: %v", err)
 		}
 		p.CalcNewChecksum(r.divert)
@@ -130,37 +144,65 @@ func (r *tcpRedirector) packetLoop(redirectPort uint16) {
 	}
 }
 
-func (r *tcpRedirector) rewritePacket(p *godivert.Packet, redirectPort uint16) error {
+func (r *tcpRedirector) rewritePacket(p *godivert.Packet, redirectPort uint16) (drop bool, err error) {
 	p.ParseHeaders()
 	srcIP := p.SrcIP()
 	dstIP := p.DstIP()
 	srcPort, err := p.SrcPort()
 	if err != nil {
-		return err
+		return false, err
 	}
 	dstPort, err := p.DstPort()
 	if err != nil {
-		return err
+		return false, err
+	}
+
+	if p.Direction() == godivert.WinDivertDirectionInbound {
+		if orig, ok := r.lookupFlow(dstIP.String(), dstPort); ok {
+			if orig.host == srcIP.String() && orig.port == srcPort {
+				Tracef("丢弃 inbound 泄漏包 %s:%d -> %s:%d（已劫持流）", srcIP, srcPort, dstIP, dstPort)
+				return true, errDropPacket
+			}
+		}
+		return false, nil
 	}
 
 	if srcPort == redirectPort {
 		orig, ok := r.lookupFlow(dstIP.String(), dstPort)
 		if !ok {
-			return nil
+			Tracef("回程改包 lookup 失败 dst=%s:%d", dstIP, dstPort)
+			return false, nil
 		}
 		p.SetSrcIP(net.ParseIP(orig.host))
-		return p.SetSrcPort(orig.port)
+		Tracef("回程改包 src -> %s:%d (client %s:%d)", orig.host, orig.port, dstIP, dstPort)
+		return false, p.SetSrcPort(orig.port)
 	}
 	if dstPort == redirectPort {
-		return nil
+		return false, nil
 	}
 	if shouldBypassIPv4(dstIP, r.bypass) {
-		return nil
+		if reason := bypassReasonIPv4(dstIP, r.bypass); reason != "" {
+			logBypassOnce(dstIP.String(), fmt.Sprintf("旁路 %s:%d 原因=%s", dstIP, dstPort, reason))
+		}
+		return false, nil
 	}
-	target := tcpOriginalTarget{host: dstIP.String(), port: dstPort, seen: time.Now()}
-	r.rememberFlow(srcIP.String(), srcPort, target)
-	p.SetDstIP(redirectLocalIP)
-	return p.SetDstPort(redirectPort)
+	syn, ack, _ := tcpFlags(p)
+	if syn && !ack {
+		target := tcpOriginalTarget{host: dstIP.String(), port: dstPort, seen: time.Now()}
+		r.rememberFlow(srcIP.String(), srcPort, target)
+		Debugf("记录流(SYN) %s:%d -> %s:%d", srcIP, srcPort, dstIP, dstPort)
+	} else if _, ok := r.lookupFlow(srcIP.String(), srcPort); !ok {
+		// 非 SYN 且无映射：可能是漏网连接，补记一次避免回程 lookup 失败。
+		target := tcpOriginalTarget{host: dstIP.String(), port: dstPort, seen: time.Now()}
+		r.rememberFlow(srcIP.String(), srcPort, target)
+	}
+	redirectIP := srcIP.To4()
+	if redirectIP == nil {
+		return false, nil
+	}
+	Tracef("拦截 TCP %s:%d -> %s:%d 重定向到 %s:%d", srcIP, srcPort, dstIP, dstPort, redirectIP, redirectPort)
+	p.SetDstIP(redirectIP)
+	return false, p.SetDstPort(redirectPort)
 }
 
 func (r *tcpRedirector) rememberFlow(clientIP string, clientPort uint16, target tcpOriginalTarget) {
@@ -242,6 +284,7 @@ func (r *tcpRedirector) acceptLoop() {
 			log.Printf("[TUN] accept: %v", err)
 			continue
 		}
+		log.Printf("[TUN-trace] 透明连接 accept remote=%s", c.RemoteAddr())
 		go r.handleConn(c)
 	}
 }
@@ -254,12 +297,47 @@ func (r *tcpRedirector) handleConn(c net.Conn) {
 	}
 	target, ok := r.lookupFlow(ta.IP.String(), uint16(ta.Port))
 	if !ok {
-		log.Printf("[TUN] 找不到原始目标 remote=%s flows=%d", c.RemoteAddr(), r.flowCount())
+		Tracef("找不到原始目标 remote=%s activeFlows=%d keys=%s",
+			c.RemoteAddr(), r.flowCount(), r.flowKeysSummary())
 		return
 	}
-	if err := socks5.RelayTCPThrough(c, target.host, target.port, r.tunnelDial); err != nil {
-		log.Printf("[TUN] 隧道 %s:%d: %v", target.host, target.port, err)
+	Tracef("透明连接 accept remote=%s 原始目标=%s:%d -> SOCKS %s",
+		c.RemoteAddr(), target.host, target.port, r.socksAddr)
+	var err error
+	if r.tunnelDial != nil {
+		Tracef("RelayTCPThrough 开始 dst=%s:%d（直连 feizhu TLS，不经 7891 回环）", target.host, target.port)
+		err = socks5.RelayTCPThrough(c, target.host, target.port, r.tunnelDial)
+	} else {
+		err = socks5.RelayTransparent(c, r.socksAddr, target.host, target.port)
 	}
+	if err != nil {
+		Tracef("经 SOCKS 转发失败 %s:%d: %v", target.host, target.port, err)
+	} else {
+		Debugf("经 SOCKS 转发完成 %s:%d", target.host, target.port)
+	}
+}
+
+func (r *tcpRedirector) flowKeysSummary() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.flows) == 0 {
+		return "(empty)"
+	}
+	const max = 8
+	var b strings.Builder
+	n := 0
+	for k, v := range r.flows {
+		if n >= max {
+			b.WriteString(" ...")
+			break
+		}
+		if n > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(&b, "%s:%d->%s:%d", k.ip, k.port, v.host, v.port)
+		n++
+	}
+	return b.String()
 }
 
 func (r *tcpRedirector) flowCount() int {
@@ -267,20 +345,4 @@ func (r *tcpRedirector) flowCount() int {
 	n := len(r.flows)
 	r.mu.Unlock()
 	return n
-}
-
-func relayConn(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(a, b)
-		_ = a.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(b, a)
-		_ = b.Close()
-	}()
-	wg.Wait()
 }

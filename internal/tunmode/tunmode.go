@@ -34,8 +34,10 @@ type Config struct {
 	AddressCIDR string
 	MTU         int
 	SOCKSListen string
+	LocalListen string
 	ServerAddr  string
 	LogLevel    string
+	TUNDebug    bool
 	// BypassIPs 中的 IPv4 在 TUN 规则里旁路（仅用于必须本机直连的地址，勿填上级代理 IP）。
 	BypassIPs []string
 	// TunnelDial Windows 透明 TCP 直连 feizhu TLS（不经 127.0.0.1 SOCKS 网络回环）。
@@ -61,6 +63,10 @@ func Start(ctx context.Context, cfg Config) (*Controller, error) {
 		return nil, fmt.Errorf("tunmode: 当前仅支持 macOS 和 Windows，当前系统为 %s", runtime.GOOS)
 	}
 	cfg = withDefaults(cfg)
+	initTUNDebugFromEnv(cfg)
+	if cfg.Enabled && runtime.GOOS == "windows" {
+		logWindowsTUNStartup(cfg)
+	}
 	if cfg.SOCKSListen == "" {
 		return nil, fmt.Errorf("tunmode: SOCKSListen 为空")
 	}
@@ -68,15 +74,25 @@ func Start(ctx context.Context, cfg Config) (*Controller, error) {
 		return nil, fmt.Errorf("tunmode: ServerAddr 为空")
 	}
 
-	// Windows：WinDivert 只拦 TCP，不碰 UDP/DNS（与 macOS pf proto tcp 等价）。
+	// Windows：仅 wintun+tun2socks（与 macOS 相同路径）。WinDivert 透明劫持已弃用（不可靠）。
 	if runtime.GOOS == "windows" {
-		return startWindowsTCPRedirect(ctx, cfg)
+		ctl, err := startTUNStack(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("tunmode: Windows wintun 启动失败（请用 build.ps1 重新编译并管理员运行）: %w", err)
+		}
+		log.Printf("[TUN] Windows wintun+tun2socks 已启动（与 macOS 同路径）")
+		return ctl, nil
 	}
 
-	return startDarwinTUNStack(ctx, cfg)
+	return startTUNStack(ctx, cfg)
 }
 
-func startDarwinTUNStack(ctx context.Context, cfg Config) (*Controller, error) {
+func startTUNStack(ctx context.Context, cfg Config) (*Controller, error) {
+	if runtime.GOOS == "windows" {
+		if err := ensureWintunLoaded(); err != nil {
+			return nil, err
+		}
+	}
 	addr, ip, prefix, err := parseAddressCIDR(cfg.AddressCIDR)
 	if err != nil {
 		return nil, err

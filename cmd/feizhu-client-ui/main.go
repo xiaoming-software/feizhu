@@ -237,6 +237,8 @@ func main() {
 
 	// 默认不输出每条连接的流水日志（避免拖垮界面）；需要排障时可勾选，下次点击「登录」生效。
 	verboseConnCheck := widget.NewCheck("显示每条连接的隧道日志（量多易卡）", nil)
+	tunDebugCheck := widget.NewCheck("TUN 排障详细日志（旁路原因/流表，写 helper 日志）", nil)
+	tunDebugCheck.SetChecked(true)
 	tunCheck := widget.NewCheck("启用 TUN 全局透明代理（会弹系统授权，仅 TCP）", nil)
 
 	var (
@@ -265,11 +267,13 @@ func main() {
 			stopBtn.Enable()
 			verboseConnCheck.Disable()
 			tunCheck.Disable()
+			tunDebugCheck.Disable()
 		} else {
 			loginBtn.Enable()
 			stopBtn.Disable()
 			verboseConnCheck.Enable()
 			tunCheck.Enable()
+			tunDebugCheck.Enable()
 		}
 	}
 
@@ -388,18 +392,20 @@ func main() {
 				SOCKS:          true,
 				SOCKSListen:    "127.0.0.1:7891",
 				TUN:            tunCheck.Checked,
+				TUNDebug:       tunDebugCheck.Checked,
 				UpstreamProxy:  strings.TrimSpace(upstreamEntry.Text),
 				LogWriter:      logWriter,
 				// 未勾选「显示每条连接…」时省略逐连接流水，保留启动/错误等日志；防抖仍限制 UI 更新频率。
-				SuppressPerConnLogs: !verboseConnCheck.Checked,
+				SuppressPerConnLogs: !verboseConnCheck.Checked && !tunDebugCheck.Checked,
 			}
 
 			if tunCheck.Checked {
 				// macOS / Windows 均仅启动提权 helper（TUN + 本地 7890/7891），与 mac 行为一致。
 				elevCfg := cfg
 				elevCfg.TUN = true
+				elevCfg.TUNDebug = tunDebugCheck.Checked
 				elevCfg.SOCKS = true
-				elevCfg.SuppressPerConnLogs = true
+				elevCfg.SuppressPerConnLogs = !verboseConnCheck.Checked && !tunDebugCheck.Checked
 				elevCfg.AutoProxy = false
 				elevCfg.AutoEnv = false
 				elevCfg.AutoCurlrc = false
@@ -469,7 +475,7 @@ func main() {
 					logWriter.Write([]byte("[curl] 已写入 ~/.curlrc fallback，普通 curl 也会走 127.0.0.1:7890\n"))
 				}
 				statusLabel.SetText(fmt.Sprintf("TUN helper 已通过系统授权启动（PID %d）", ep.PID))
-				logWriter.Write([]byte(fmt.Sprintf("[TUN] 已启动提权 helper PID=%d\n[TUN] helper 日志: %s\n[TUN] 指纹浏览器可继续用配置里的远程代理；上级代理仅在飞猪填写即可\n", ep.PID, ep.LogFile)))
+				logWriter.Write([]byte(fmt.Sprintf("[TUN] 已启动提权 helper PID=%d\n[TUN] helper 日志（排障必看）: %s\n[TUN] 日志含 [TUN-trace]/[TUN-debug]；AdsPower 测试后把 helper 日志发给我分析\n", ep.PID, ep.LogFile)))
 				return
 			}
 
@@ -524,7 +530,7 @@ func main() {
 	btnRow := container.NewHBox(loginBtn, layout.NewSpacer(), stopBtn)
 
 	upstreamRow := container.NewBorder(nil, nil, widget.NewLabel("上级代理"), nil, upstreamEntry)
-	optionRow := container.NewHBox(tunCheck, layout.NewSpacer(), verboseConnCheck)
+	optionRow := container.NewHBox(tunCheck, tunDebugCheck, layout.NewSpacer(), verboseConnCheck)
 	logHeaderRow := container.NewHBox(widget.NewLabel("◆ 运行日志"), layout.NewSpacer())
 	header := container.NewVBox(
 		serverRow,

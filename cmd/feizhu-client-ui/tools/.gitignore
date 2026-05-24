@@ -1,0 +1,4 @@
+mingw64/
+_winlibs_extract/
+winlibs-mingw.zip
+*.part

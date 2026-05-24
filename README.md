@@ -156,7 +156,7 @@ eval "$(feizhu-client -print-proxy-env)"
 
 **macOS 提示**：若在 feizhu-client 启动前已打开「终端」，新建窗口可能读不到 `http_proxy`；请 **Cmd+Q 完全退出终端再打开**，或依赖默认开启的 `-auto-curlrc`。
 
-**TUN 提示**：macOS 通过 `pf` 只拦截出站 **TCP**，UDP/DNS 不走 TUN。Windows 使用 **WinDivert 仅拦 TCP**（与 mac 策略一致），经本地 SOCKS5 → feizhu TLS；**不劫持 UDP DNS**，指纹浏览器可继续用原有 DNS。`198.18.0.0/15` fake-ip 会从 TCP 首包解析 SNI/Host。
+**TUN 提示**：macOS 通过 `pf` + utun 只拦截出站 **TCP**。Windows 使用 **WinDivert** 透明拦截出站 TCP，经本地 SOCKS5 → feizhu TLS（与 mac 数据路径一致）。**不劫持 UDP DNS**。AdsPower 等指纹浏览器若透明模式仍异常，请在配置里填 SOCKS5 `127.0.0.1:7891`（与 Chrome 走系统代理等效，最可靠）。
 
 **Windows 打包**：`build.sh` 将 **WinDivert.dll + WinDivert64.sys 嵌入 exe**，首次启用 TUN 时释放到 exe 同目录。发给客户**只需一个 exe**（需管理员/UAC 开 TUN）。
 
