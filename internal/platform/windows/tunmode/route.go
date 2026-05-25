@@ -62,9 +62,14 @@ func applyRoutes(c routeConfig) error {
 		return err
 	}
 	if err := configureTUNDNS(c.DeviceName); err != nil {
-		log.Printf("[TUN] 配置 Windows TUN DNS 失败（Chrome 可能仍受本机 DNS 影响）: %v", err)
+		log.Printf("[TUN] 配置 Windows TUN DNS 失败: %v", err)
 	} else {
-		log.Printf("[TUN] Windows TUN DNS 已设置为 %s；DNS 查询将随 TUN 进入 feizhu TLS", strings.Join(windowsTUNDNSServers, ", "))
+		log.Printf("[TUN] Windows TUN DNS 已设置为 %s", strings.Join(windowsTUNDNSServers, ", "))
+	}
+	if err := applyPhysDNS(c.State.IfIndex); err != nil {
+		log.Printf("[TUN] 设置物理网卡 DNS 为 8.8.8.8/1.1.1.1 失败（公司内网 DNS 可能导致指纹浏览器异常）: %v", err)
+	} else if c.State.Interface != "" {
+		log.Printf("[TUN] Windows 物理网卡 DNS(%s) 已设为 %s，解析走 TUN（与 macOS 一致）", c.State.Interface, strings.Join(windowsTUNDNSServers, ", "))
 	}
 	physIf := strconv.Itoa(c.State.IfIndex)
 	gw := c.State.Gateway.String()
@@ -105,6 +110,7 @@ func applyRoutes(c routeConfig) error {
 }
 
 func restoreRoutes(c routeConfig) error {
+	_ = restorePhysDNS(c.State.IfIndex, c.State.DNSIPs)
 	_ = resetTUNDNS(c.DeviceName)
 	_ = runWindows("route", "delete", "0.0.0.0", "mask", "128.0.0.0")
 	_ = runWindows("route", "delete", "128.0.0.0", "mask", "128.0.0.0")
@@ -162,6 +168,37 @@ func windowsDNSIPsForInterface(ifIndex int) []net.IP {
 		}
 	}
 	return ips
+}
+
+// applyPhysDNS 将默认物理网卡 DNS 设为公网解析器，避免公司内网 DNS 返回 198.18 fake-ip。
+func applyPhysDNS(ifIndex int) error {
+	if ifIndex <= 0 {
+		return nil
+	}
+	quoted := make([]string, 0, len(windowsTUNDNSServers))
+	for _, s := range windowsTUNDNSServers {
+		quoted = append(quoted, "'"+s+"'")
+	}
+	script := fmt.Sprintf(`Set-DnsClientServerAddress -InterfaceIndex %d -ServerAddresses @(%s)`, ifIndex, strings.Join(quoted, ","))
+	return runWindows("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+}
+
+func restorePhysDNS(ifIndex int, saved []net.IP) error {
+	if ifIndex <= 0 {
+		return nil
+	}
+	if len(saved) == 0 {
+		script := fmt.Sprintf(`Set-DnsClientServerAddress -InterfaceIndex %d -ResetServerAddresses -ErrorAction SilentlyContinue`, ifIndex)
+		return runWindows("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+	}
+	quoted := make([]string, 0, len(saved))
+	for _, ip := range saved {
+		if ip != nil {
+			quoted = append(quoted, "'"+ip.String()+"'")
+		}
+	}
+	script := fmt.Sprintf(`Set-DnsClientServerAddress -InterfaceIndex %d -ServerAddresses @(%s)`, ifIndex, strings.Join(quoted, ","))
+	return runWindows("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
 }
 
 func configureTUNDNS(deviceName string) error {
