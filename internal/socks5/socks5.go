@@ -71,7 +71,8 @@ func Serve(c net.Conn, dial DialFunc) error {
 		_ = sendRep(c, 0x07) // command not supported
 		return fmt.Errorf("socks5: 不支持的 CMD %d（仅支持 CONNECT/UDP ASSOCIATE）", cmd)
 	}
-	if isFakeIPv4(host) && (port == 443 || port == 80) {
+	host = resolveDialHost(host, port)
+	if isFakeIPv4(host) {
 		return serveFakeIPConnect(c, host, port, dial)
 	}
 	rc, err := dial(host, port)
@@ -93,6 +94,7 @@ func Serve(c net.Conn, dial DialFunc) error {
 }
 
 func serveFakeIPConnect(c net.Conn, host string, port uint16, dial DialFunc) error {
+	host = resolveDialHost(host, port)
 	if _, err := c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 		return err
 	}
@@ -113,8 +115,9 @@ func serveFakeIPConnect(c net.Conn, host string, port uint16, dial DialFunc) err
 	if target == "" {
 		target = host
 	}
+	target = resolveDialHost(target, port)
 	if target == host && isFakeIPv4(host) {
-		log.Printf("[socks5] fake-ip %s:%d 未能从首包解析域名，将按假 IP 拨号（易失败）", host, port)
+		log.Printf("[socks5] fake-ip %s:%d 未能还原真实地址（请重启指纹配置并确认 TUN 已把系统 DNS 设为 8.8.8.8）", host, port)
 	}
 	rc, err := dial(target, port)
 	if err != nil {
@@ -478,6 +481,7 @@ func relayDNSOverTunnelTCP(server *net.UDPConn, client *net.UDPAddr, dial DialFu
 		if res.err != nil || len(res.body) == 0 {
 			return
 		}
+		recordDNSResponse(res.body)
 		out := buildUDPResponse(host, port, res.body)
 		_, _ = server.WriteToUDP(out, client)
 	}

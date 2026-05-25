@@ -3,6 +3,7 @@ package mactun
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -43,10 +44,16 @@ func applyRoutes(c routeConfig) error {
 	if err := applyPF(c, peer); err != nil {
 		return err
 	}
+	if err := applySystemDNS(c.State.Interface); err != nil {
+		log.Printf("[TUN] 设置系统 DNS 为 8.8.8.8/1.1.1.1 失败（公司内网 DNS 可能导致 fake-ip）: %v", err)
+	} else if svc := networkServiceForInterface(c.State.Interface); svc != "" {
+		log.Printf("[TUN] macOS 系统 DNS(%s) 已设为 8.8.8.8/1.1.1.1，解析走 TUN UDP/53 → feizhu", svc)
+	}
 	return nil
 }
 
 func restoreRoutes(c routeConfig) error {
+	_ = restoreSystemDNS(c.State.Interface, c.State.DNSIPs)
 	_ = runDarwin("pfctl", "-a", "com.apple/feizhu", "-F", "all")
 	for _, ip := range c.State.ServerIPs {
 		_ = runDarwin("route", "-n", "delete", "-host", ip.String())
@@ -67,11 +74,12 @@ func applyPF(c routeConfig, peer net.IP) error {
 	for _, ip := range c.State.ServerIPs {
 		bypass = append(bypass, ip.String())
 	}
-	// macOS 无 Windows 式 0.0.0.0/1 路由，公网 TCP 与 DNS(UDP/53) 均靠 pf route-to 进 TUN。
+	// macOS 无 Windows 式 0.0.0.0/1 路由；公网 TCP 与 DNS(UDP/TCP 53) 均靠 pf route-to 进 TUN。
 	rules := fmt.Sprintf(`table <feizhu_bypass> const { %s }
 pass out quick route-to (%s %s) inet proto udp from any to any port 53 keep state
+pass out quick route-to (%s %s) inet proto tcp from any to any port 53 flags S/SA keep state
 pass out quick route-to (%s %s) inet proto tcp from any to ! <feizhu_bypass> flags S/SA keep state
-`, strings.Join(bypass, ", "), c.DeviceName, peer.String(), c.DeviceName, peer.String())
+`, strings.Join(bypass, ", "), c.DeviceName, peer.String(), c.DeviceName, peer.String(), c.DeviceName, peer.String())
 	path, err := writePFRules(rules)
 	if err != nil {
 		return err
@@ -154,6 +162,31 @@ func darwinDNSIPsForInterface(iface string) []net.IP {
 		return darwinDNSIPs()
 	}
 	return ips
+}
+
+func applySystemDNS(iface string) error {
+	svc := networkServiceForInterface(iface)
+	if svc == "" {
+		return nil
+	}
+	return runDarwin("networksetup", "-setdnsservers", svc, "8.8.8.8", "1.1.1.1")
+}
+
+func restoreSystemDNS(iface string, saved []net.IP) error {
+	svc := networkServiceForInterface(iface)
+	if svc == "" {
+		return nil
+	}
+	if len(saved) == 0 {
+		return runDarwin("networksetup", "-setdnsservers", svc, "Empty")
+	}
+	args := []string{"-setdnsservers", svc}
+	for _, ip := range saved {
+		if ip != nil {
+			args = append(args, ip.String())
+		}
+	}
+	return runDarwin("networksetup", args...)
 }
 
 func networkServiceForInterface(iface string) string {
